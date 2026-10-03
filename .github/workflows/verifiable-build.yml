@@ -1,0 +1,54 @@
+# Reproducible build of the Alphabros router, as the Solana verifiers do it: solana-verify in the
+# solanafoundation/solana-verifiable-build:4.3.0 Docker image (pinned in Cargo.toml [workspace.metadata.cli]).
+# Outputs (workflow artifacts): the program binary, its executable hash, and the Anchor IDL. Also runs the LiteSVM
+# tests against that exact binary. Nothing here holds a key or touches mainnet.
+name: verifiable-build
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: ~/.cargo/bin
+
+      - name: Install solana-verify
+        run: command -v solana-verify || cargo install solana-verify --locked
+
+      - name: Verifiable build (Docker)
+        run: solana-verify build --library-name alphabros_router
+
+      - name: Executable hash
+        run: |
+          solana-verify get-executable-hash target/deploy/alphabros_router.so | tee target/deploy/alphabros_router.hash
+          sha256sum target/deploy/*.so
+
+      - name: Tests against this binary
+        run: |
+          test -f target/deploy/mock_swap.so || solana-verify build --library-name mock_swap
+          cd tests && cargo test --test router
+
+      - name: Install Anchor CLI 1.2.0
+        run: command -v anchor || cargo install --git https://github.com/solana-foundation/anchor --tag v1.2.0 anchor-cli --locked
+
+      - name: IDL
+        run: |
+          mkdir -p target/idl
+          anchor idl build -p alphabros_router -o target/idl/alphabros_router.json
+          head -c 400 target/idl/alphabros_router.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alphabros_router-verifiable
+          path: |
+            target/deploy/alphabros_router.so
+            target/deploy/alphabros_router.hash
+            target/idl/alphabros_router.json

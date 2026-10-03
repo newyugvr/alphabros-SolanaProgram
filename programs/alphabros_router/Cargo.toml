@@ -1,0 +1,25 @@
+[package]
+name = "alphabros_router"
+version = "0.1.0"
+description = "Alphabros V2 fee router for Solana: per-trader routers, exact fee in SOL, swaps through any venue (permissionless)"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "alphabros_router"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "1.2.0"
+anchor-spl = { version = "1.2.0", default-features = false, features = ["token", "token_2022"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

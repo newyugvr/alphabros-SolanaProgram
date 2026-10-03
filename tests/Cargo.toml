@@ -1,0 +1,31 @@
+[package]
+name = "alphabros-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+alphabros_router = { path = "../programs/alphabros_router", features = ["no-entrypoint"] }
+mock_swap = { path = "../programs/mock_swap", features = ["no-entrypoint"] }
+anchor-lang = "1.2.0"
+litesvm = "0.17.0"
+solana-keypair = "3"
+solana-signer = "3"
+solana-transaction = { version = "4", features = ["serde"] }
+solana-message = "4"
+solana-account = "4"
+solana-instruction = "3"
+solana-sdk-ids = "3"
+solana-system-interface = "2"
+spl-token-interface = "3"
+spl-token-2022-interface = "3"
+spl-associated-token-account-interface = "2"
+solana-pubkey = "3"
+solana-program-pack = "3"
+solana-program-option = "3"
+solana-clock = "3"
+serde_json = "1"
+base64 = "0.22"
+bincode = "1"

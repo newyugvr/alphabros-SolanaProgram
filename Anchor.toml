@@ -1,0 +1,17 @@
+[toolchain]
+anchor_version = "1.2.0"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+alphabros_router = "9Gv5FLbNg4iKEDK9dM7twBrCjc65KEMpthG3SoYq53Aa"
+mock_swap = "Hte3qNH744tdMRdrajqyfakcLgwZmcj4iNTd28i75dAm"
+
+[programs.mainnet]
+alphabros_router = "9Gv5FLbNg4iKEDK9dM7twBrCjc65KEMpthG3SoYq53Aa"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
