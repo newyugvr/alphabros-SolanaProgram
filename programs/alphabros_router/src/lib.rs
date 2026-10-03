@@ -31,6 +31,16 @@ use anchor_lang::solana_program::{
 };
 use anchor_spl::token_interface::TokenAccount;
 
+// Security contact and source, readable by explorers (solana-security-txt). Not part of the library build.
+#[cfg(not(feature = "no-entrypoint"))]
+solana_security_txt::security_txt! {
+    name: "Alphabros Router",
+    project_url: "https://github.com/newyugvr/alphabros-SolanaProgram",
+    contacts: "link:https://github.com/newyugvr/alphabros-SolanaProgram/security",
+    policy: "https://github.com/newyugvr/alphabros-SolanaProgram/security",
+    source_code: "https://github.com/newyugvr/alphabros-SolanaProgram"
+}
+
 declare_id!("9Gv5FLbNg4iKEDK9dM7twBrCjc65KEMpthG3SoYq53Aa");
 
 /// Protocol fee: 0.25% of the trade. Fixed forever.
