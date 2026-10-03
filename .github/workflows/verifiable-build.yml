@@ -1,18 +1,20 @@
 # Reproducible build of the Alphabros router, as the Solana verifiers do it: solana-verify in the
 # solanafoundation/solana-verifiable-build:4.3.0 Docker image (pinned in Cargo.toml [workspace.metadata.cli]).
-# Outputs (workflow artifacts): the program binary, its executable hash, and the Anchor IDL. Also runs the LiteSVM
-# tests against that exact binary. Nothing here holds a key or touches mainnet.
+# Publishes the program binary, its executable hash and the Anchor IDL as a release (build-<short sha>), and runs the
+# LiteSVM tests against that exact binary. Nothing here holds a key or touches any cluster.
 name: verifiable-build
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,17 +26,28 @@ jobs:
         run: command -v solana-verify || cargo install solana-verify --locked
 
       - name: Verifiable build (Docker)
-        run: solana-verify build --library-name alphabros_router
+        run: |
+          solana-verify build --library-name alphabros_router
+          sudo chown -R "$(id -u):$(id -g)" target
+          find target -name "*.so" -maxdepth 3 -exec ls -la {} \;
 
       - name: Executable hash
         run: |
-          solana-verify get-executable-hash target/deploy/alphabros_router.so | tee target/deploy/alphabros_router.hash
-          sha256sum target/deploy/*.so
+          set -o pipefail
+          HASH=$(solana-verify get-executable-hash target/deploy/alphabros_router.so | tail -1)
+          echo "$HASH" > target/deploy/alphabros_router.hash
+          sha256sum target/deploy/alphabros_router.so | tee target/deploy/alphabros_router.sha256
+          echo "::notice title=executable-hash::$HASH"
+          echo "::notice title=sha256::$(cut -d' ' -f1 target/deploy/alphabros_router.sha256) size $(stat -c%s target/deploy/alphabros_router.so)"
 
       - name: Tests against this binary
         run: |
-          test -f target/deploy/mock_swap.so || solana-verify build --library-name mock_swap
-          cd tests && cargo test --test router
+          if [ ! -f target/deploy/mock_swap.so ]; then
+            solana-verify build --library-name mock_swap
+            sudo chown -R "$(id -u):$(id -g)" target
+          fi
+          cd tests && cargo test --test router 2>&1 | tee ../target/tests.log
+          echo "::notice title=tests::$(grep 'test result' ../target/tests.log | tail -1)"
 
       - name: Install Anchor CLI 1.2.0
         run: command -v anchor || cargo install --git https://github.com/solana-foundation/anchor --tag v1.2.0 anchor-cli --locked
@@ -43,12 +56,20 @@ jobs:
         run: |
           mkdir -p target/idl
           anchor idl build -p alphabros_router -o target/idl/alphabros_router.json
-          head -c 400 target/idl/alphabros_router.json
+          echo "::notice title=idl::$(wc -c < target/idl/alphabros_router.json) bytes"
 
-      - uses: actions/upload-artifact@v4
+      - name: Report failure
+        if: failure()
+        run: echo "::error title=failed-step::see the step marked failed; target/deploy:$(ls target/deploy 2>&1 | tr '\n' ' ')"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
         with:
-          name: alphabros_router-verifiable
-          path: |
+          tag_name: build-${{ github.sha }}
+          name: Verifiable build ${{ github.sha }}
+          body: Built with solana-verify (image 4.3.0) from this commit. Executable hash in alphabros_router.hash.
+          files: |
             target/deploy/alphabros_router.so
             target/deploy/alphabros_router.hash
+            target/deploy/alphabros_router.sha256
             target/idl/alphabros_router.json
