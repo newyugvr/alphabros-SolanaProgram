@@ -19,10 +19,16 @@ it with the venue they choose and pay an exact fee in SOL.
     and output (`SwapAccountNotBound`); no SPL multisig may appear (`MultisigNotAllowed`);
   - no account a native program owns (stake, vote, program data, lookup table) may be writable in the swap, nor a
     system account holding data such as a durable nonce (`ProtectedAccount`);
-  - only the user's signature is passed on, and the user's wallet reaches the swap read-only;
+  - only the user's signature is passed on, and the user's wallet reaches the swap read-only (see `execute_v2`);
   - the owner, delegate and close authority of both measured accounts must be unchanged after the swap
-    (`AccountAuthorityChanged`);
+    (`AccountAuthorityChanged`), and neither may lose lamports beyond its token amount: rent, surplus or unsynced
+    wSOL lamports (`AccountLamportsTaken`);
   - the router itself and the native programs are never venues (`VenueNotAllowed`).
+- **`execute_v2`** is `execute` for venues that trade the wallet's own SOL (bonding curves such as Pump.fun, AMMs
+  that take SOL fees or rent from the wallet). The user signs `max_wallet_spend` (at most 100 SOL); above zero, the
+  wallet is writable in the swap. After the swap the wallet must still be a plain system account (`WalletTampered`)
+  that lost at most `max_wallet_spend` (`WalletSpendTooHigh`). The SOL side is measured net, the wSOL account's change
+  plus the wallet's change, signed, and `max_input`, `min_out` and the fee apply to that. `execute` is unchanged.
 - **Jupiter v6:** the instruction must be one of its ten route instructions (`JupiterNotARoute`) with Jupiter's own
   platform fee off: no platform-fee account on the six original routes, `platform_fee_bps` and
   `positive_slippage_bps` zero on the four v2 routes (`JupiterPlatformFee`).
@@ -39,7 +45,7 @@ it with the venue they choose and pay an exact fee in SOL.
 | A router's fee wallet | that router's owner | same |
 | Config / router ownership | current owner | two steps: `transfer_*_ownership`, then `accept_*_ownership` |
 
-Nobody can move a user's tokens except through that user's own `execute`, or move anyone's credit.
+Nobody can move a user's tokens except through that user's own `execute` or `execute_v2`, or move anyone's credit.
 
 ## Layout
 

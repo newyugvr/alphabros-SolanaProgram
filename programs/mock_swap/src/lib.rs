@@ -68,6 +68,93 @@ pub mod mock_swap {
         Ok(())
     }
 
+    /// Bonding-curve venue for tests (Pump.fun style): trades the token against the user's WALLET SOL, not wSOL.
+    /// Buy: takes `lamports_in` from the wallet and pays `amount_out` tokens. Sell: takes `amount_in` tokens and pays
+    /// `lamports_out` from the curve (the pool PDA) to the wallet.
+    pub fn curve(ctx: Context<Curve>, lamports_in: u64, amount_out: u64, amount_in: u64, lamports_out: u64) -> Result<()> {
+        let bump = ctx.bumps.pool_authority;
+        let seeds: &[&[&[u8]]] = &[&[POOL_SEED, &[bump]]];
+        if lamports_in > 0 {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.user.to_account_info(),
+                        to: ctx.accounts.pool_authority.to_account_info(),
+                    },
+                ),
+                lamports_in,
+            )?;
+        }
+        if amount_out > 0 {
+            token_interface::transfer_checked(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.key(),
+                    TransferChecked {
+                        from: ctx.accounts.pool_token.to_account_info(),
+                        mint: ctx.accounts.mint.to_account_info(),
+                        to: ctx.accounts.user_token.to_account_info(),
+                        authority: ctx.accounts.pool_authority.to_account_info(),
+                    },
+                    seeds,
+                ),
+                amount_out,
+                ctx.accounts.mint.decimals,
+            )?;
+        }
+        if amount_in > 0 {
+            token_interface::transfer_checked(
+                CpiContext::new(
+                    ctx.accounts.token_program.key(),
+                    TransferChecked {
+                        from: ctx.accounts.user_token.to_account_info(),
+                        mint: ctx.accounts.mint.to_account_info(),
+                        to: ctx.accounts.pool_token.to_account_info(),
+                        authority: ctx.accounts.user.to_account_info(),
+                    },
+                ),
+                amount_in,
+                ctx.accounts.mint.decimals,
+            )?;
+        }
+        if lamports_out > 0 {
+            anchor_lang::system_program::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.pool_authority.to_account_info(),
+                        to: ctx.accounts.user.to_account_info(),
+                    },
+                    seeds,
+                ),
+                lamports_out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Hostile venue doing several things in one swap: the remaining accounts are consecutive groups of a target
+    /// program followed by `counts[i]` accounts, each called with `datas[i]` and every permission it was given.
+    pub fn relay_many<'info>(ctx: Context<'info, Relay>, counts: Vec<u8>, datas: Vec<Vec<u8>>) -> Result<()> {
+        let mut rest = ctx.remaining_accounts;
+        for (count, data) in counts.iter().zip(datas) {
+            let (target, tail) = rest.split_first().ok_or(error!(ErrorCode::AccountNotEnoughKeys))?;
+            let (accounts, tail) = tail.split_at(*count as usize);
+            let metas = accounts
+                .iter()
+                .map(|a| anchor_lang::solana_program::instruction::AccountMeta {
+                    pubkey: *a.key,
+                    is_signer: a.is_signer,
+                    is_writable: a.is_writable,
+                })
+                .collect();
+            let ix = anchor_lang::solana_program::instruction::Instruction { program_id: *target.key, accounts: metas, data };
+            anchor_lang::solana_program::program::invoke(&ix, ctx.remaining_accounts)?;
+            rest = tail;
+        }
+        Ok(())
+    }
+
     /// Hostile venue for tests: calls `target` (the first remaining account) with `data` and the other remaining
     /// accounts, passing on every signature and write permission it was given. Whatever a venue could do with the
     /// user's signature, a test can make it do through this.
@@ -89,6 +176,22 @@ pub mod mock_swap {
 
 #[derive(Accounts)]
 pub struct Relay {}
+
+#[derive(Accounts)]
+pub struct Curve<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut)]
+    pub user_token: InterfaceAccount<'info, TokenAccount>,
+    #[account(mut)]
+    pub pool_token: InterfaceAccount<'info, TokenAccount>,
+    /// CHECK: the pool's signing PDA, also the curve's SOL reserve.
+    #[account(mut, seeds = [POOL_SEED], bump)]
+    pub pool_authority: UncheckedAccount<'info>,
+    pub mint: InterfaceAccount<'info, Mint>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
 
 #[derive(Accounts)]
 pub struct Swap<'info> {

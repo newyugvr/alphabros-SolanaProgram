@@ -1268,3 +1268,309 @@ fn venue_cannot_leave_an_approval_behind() {
     assert_eq!(acc.delegate, COption::None, "no approval survived");
     assert_eq!(acc.amount, 100 * SOL, "nothing moved");
 }
+
+// ================================================================================ execute_v2: wallet-SOL venues
+
+impl Env {
+    /// The mock bonding curve: trades `self.meme` against the user's wallet SOL (the pool PDA holds the curve's SOL).
+    fn curve_ix(&self, lamports_in: u64, amount_out: u64, amount_in: u64, lamports_out: u64) -> Instruction {
+        Instruction {
+            program_id: mock_swap::ID,
+            accounts: mock_swap::accounts::Curve {
+                user: self.user.pubkey(),
+                user_token: self.user_meme,
+                pool_token: self.pool_meme,
+                pool_authority: pool_authority(),
+                mint: self.meme,
+                token_program: token_program(),
+                system_program: solana_system_interface::program::ID,
+            }
+            .to_account_metas(None),
+            data: mock_swap::instruction::Curve { lamports_in, amount_out, amount_in, lamports_out }.data(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_v2_ix(&self, input: Pubkey, output: Pubkey, venue: Instruction, min_out: u64, max_fee: u64, max_input: u64, max_wallet_spend: u64) -> Instruction {
+        let mut ix = self.execute_ix_full(&self.user.pubkey(), self.router, input, output, venue.clone(), min_out, max_fee, max_input, i64::MAX);
+        ix.data = router::instruction::ExecuteV2 { min_out, max_fee, max_input, max_wallet_spend, deadline: i64::MAX, swap_data: venue.data }.data();
+        ix
+    }
+
+    /// Sends `ix` signed by the user with a separate fee payer, so the user's lamports move only by the swap and fee.
+    fn send_relayed(&mut self, ix: Instruction) -> Result<(), TransactionError> {
+        let relayer = Keypair::new();
+        self.svm.airdrop(&relayer.pubkey(), SOL).unwrap();
+        let user = self.user.insecure_clone();
+        self.send(&[ix], &relayer, &[&user])
+    }
+
+    fn curve_buy(&mut self, lamports_in: u64, meme_out: u64, max_input: u64, max_wallet_spend: u64) -> Result<(), TransactionError> {
+        let venue = self.curve_ix(lamports_in, meme_out, 0, 0);
+        let ix = self.execute_v2_ix(self.user_wsol, self.user_meme, venue, 1, SOL, max_input, max_wallet_spend);
+        self.send_relayed(ix)
+    }
+}
+
+/// A bonding-curve buy paid from the wallet: the wallet SOL is the SOL side, so the full percentage is charged on it,
+/// and the user loses exactly the curve's price plus that fee.
+#[test]
+fn v2_curve_buy_charges_fee_on_wallet_sol() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let w0 = env.lamports(&u);
+    let sol_in = 10 * SOL;
+    env.curve_buy(sol_in, 1_000_000, sol_in, sol_in).unwrap();
+    let fee = pct(sol_in, 40);
+    assert_eq!(env.config().total_credited, fee, "0.40% of the 10 wallet SOL");
+    assert_eq!(w0 - env.lamports(&u), sol_in + fee, "price plus fee, nothing else");
+    assert_eq!(env.balance(&env.user_meme), 1_000_000);
+    assert_eq!(env.balance(&env.user_wsol), 100 * SOL, "wSOL untouched");
+    env.assert_solvent();
+}
+
+/// A bonding-curve sell paid into the wallet: the wallet SOL received is the SOL side and counts toward min_out.
+#[test]
+fn v2_curve_sell_charges_fee_on_wallet_sol_and_checks_min_out() {
+    let mut env = Env::new();
+    env.svm.airdrop(&pool_authority(), 100 * SOL).unwrap();
+    env.curve_buy(SOL, 5_000_000, SOL, SOL).unwrap();
+    let before = env.config().total_credited;
+    let sol_out = 4 * SOL;
+    let venue = env.curve_ix(0, 0, 5_000_000, sol_out);
+    let ix = env.execute_v2_ix(env.user_meme, env.user_wsol, venue.clone(), sol_out + 1, SOL, u64::MAX, 1);
+    let e = env.send_relayed(ix).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::InsufficientOutput)), "wallet SOL is the output");
+    let u = env.user.pubkey();
+    let w0 = env.lamports(&u);
+    let ix = env.execute_v2_ix(env.user_meme, env.user_wsol, venue, sol_out, SOL, u64::MAX, 1);
+    env.send_relayed(ix).unwrap();
+    let fee = pct(sol_out, 40);
+    assert_eq!(env.config().total_credited - before, fee, "0.40% of the 4 SOL received");
+    assert_eq!(env.lamports(&u) - w0, sol_out - fee);
+    env.assert_solvent();
+}
+
+/// The wallet spend is capped by what the user signed, and the wallet SOL counts toward max_input.
+#[test]
+fn v2_wallet_spend_and_max_input_enforced() {
+    let mut env = Env::new();
+    let e = env.curve_buy(2 * SOL, 1_000, u64::MAX, 2 * SOL - 1).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::WalletSpendTooHigh)));
+    let e = env.curve_buy(2 * SOL, 1_000, 2 * SOL - 1, 2 * SOL).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::InputTooHigh)));
+    let e = env.curve_buy(SOL, 1_000, u64::MAX, router::MAX_WALLET_SPEND + 1).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::AboveCap)));
+    env.curve_buy(SOL, 1_000, u64::MAX, router::MAX_WALLET_SPEND).unwrap();
+    env.assert_solvent();
+}
+
+/// Without a signed wallet spend the wallet stays read-only: `execute`, and `execute_v2` with 0, cannot reach it.
+#[test]
+fn v2_zero_wallet_spend_keeps_the_wallet_read_only() {
+    let mut env = Env::new();
+    let venue = env.curve_ix(SOL, 1_000, 0, 0);
+    let u = env.user.pubkey();
+    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue.clone(), 1, SOL, i64::MAX);
+    let e = env.send_relayed(ix).unwrap_err();
+    assert_eq!(e, TransactionError::InstructionError(0, InstructionError::Custom(2000)), "venue sees a read-only wallet");
+    let ix = env.execute_v2_ix(env.user_wsol, env.user_meme, venue, 1, SOL, u64::MAX, 0);
+    let e = env.send_relayed(ix).unwrap_err();
+    assert_eq!(e, TransactionError::InstructionError(0, InstructionError::Custom(2000)), "venue sees a read-only wallet");
+    // A venue that just asks the System program to move the wallet's SOL: the runtime refuses it.
+    let w0 = env.lamports(&u);
+    let take = env.relay(solana_system_interface::instruction::transfer(&u, &Pubkey::new_unique(), SOL));
+    for v2 in [false, true] {
+        let ix = if v2 {
+            env.execute_v2_ix(env.user_wsol, env.user_meme, take.clone(), 1, SOL, u64::MAX, 0)
+        } else {
+            env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, take.clone(), 1, SOL, i64::MAX)
+        };
+        let e = env.send_relayed(ix).unwrap_err();
+        println!("read-only wallet transfer (v2={v2}): {e:?}");
+        assert!(custom_code(&e).is_none(), "refused by the runtime, not a router check");
+    }
+    assert_eq!(env.lamports(&u), w0);
+    env.untouched();
+}
+
+/// A hostile venue with the writable wallet and the user's signature: Assign (hand the wallet to a program),
+/// Allocate (give it data), or a plain transfer to a thief. All refused.
+#[test]
+fn v2_hostile_venue_cannot_take_over_or_drain_the_wallet() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let thief = Pubkey::new_unique();
+    let cases = [
+        (solana_system_interface::instruction::assign(&u, &mock_swap::ID), code(RouterError::WalletTampered)),
+        (solana_system_interface::instruction::allocate(&u, 64), code(RouterError::WalletTampered)),
+        // more than signed: refused by the cap
+        (solana_system_interface::instruction::transfer(&u, &thief, 2 * SOL), code(RouterError::WalletSpendTooHigh)),
+        // within the cap, but nothing bought with it: refused by min_out
+        (solana_system_interface::instruction::transfer(&u, &thief, SOL), code(RouterError::InsufficientOutput)),
+    ];
+    for (inner, want) in cases {
+        let venue = env.relay(inner);
+        let ix = env.execute_v2_ix(env.user_wsol, env.user_meme, venue, 1, SOL, u64::MAX, SOL);
+        let e = env.send_relayed(ix).unwrap_err();
+        assert_eq!(custom_code(&e), Some(want));
+    }
+    assert_eq!(env.lamports(&thief), 0);
+    let acc = env.svm.get_account(&u).unwrap();
+    assert_eq!(acc.owner, solana_system_interface::program::ID);
+    assert!(acc.data.is_empty());
+    env.untouched();
+}
+
+/// `execute_v2` keeps every `execute` rule: the ordinary wSOL swap charges the same fee as `execute`.
+#[test]
+fn v2_wsol_swap_matches_execute() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, 50 * SOL, 1_000_000);
+    let ix = env.execute_v2_ix(env.user_wsol, env.user_meme, venue, 1_000_000, SOL, 50 * SOL, SOL);
+    env.send_relayed(ix).unwrap();
+    assert_eq!(env.config().total_credited, pct(50 * SOL, 40));
+    env.assert_solvent();
+}
+
+// ================================================================================ review: net SOL and account lamports
+
+impl Env {
+    /// A hostile venue doing every instruction in `calls`, in order, with every permission it was given.
+    fn relay_many(&self, calls: Vec<Instruction>) -> Instruction {
+        let mut accounts = vec![];
+        let mut counts = vec![];
+        let mut datas = vec![];
+        for c in calls {
+            accounts.push(solana_instruction::AccountMeta::new_readonly(c.program_id, false));
+            counts.push(c.accounts.len() as u8);
+            accounts.extend(c.accounts);
+            datas.push(c.data);
+        }
+        Instruction { program_id: mock_swap::ID, accounts, data: mock_swap::instruction::RelayMany { counts, datas }.data() }
+    }
+
+    /// The user holds `meme` (bought on the curve) and the curve holds SOL to buy it back.
+    fn holding_meme(&mut self, meme: u64) {
+        self.svm.airdrop(&pool_authority(), 100 * SOL).unwrap();
+        self.curve_buy(SOL, meme, SOL, SOL).unwrap();
+    }
+}
+
+/// Review H-1, exactly: a sell where the venue empties the user's existing wSOL output (10 SOL) and pays 0.01 SOL to
+/// the wallet. Net the SOL side LOST 9.99 SOL, so `min_out` = 0.01 SOL must fail.
+#[test]
+fn review_h1_wsol_loss_cannot_hide_behind_wallet_gain() {
+    let mut env = Env::new();
+    env.holding_meme(5_000_000);
+    let u = env.user.pubkey();
+    let thief_wsol = Pubkey::new_unique();
+    env.token_account(thief_wsol, wsol(), Pubkey::new_unique(), 0);
+    let drain = spl_token_interface::instruction::transfer(&token_program(), &env.user_wsol, &thief_wsol, &u, &[], 10 * SOL).unwrap();
+    let venue = env.relay_many(vec![drain, env.curve_ix(0, 0, 5_000_000, SOL / 100)]);
+    let ix = env.execute_v2_ix(env.user_meme, env.user_wsol, venue, SOL / 100, SOL, u64::MAX, 1);
+    let e = env.send_relayed(ix).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::InsufficientOutput)));
+    assert_eq!(env.balance(&thief_wsol), 0);
+    assert_eq!(env.balance(&env.user_wsol), 100 * SOL);
+}
+
+/// Review H-1, second case: a sell that pays the venue's costs from the wallet. Proceeds are measured net of them.
+#[test]
+fn review_h1_sell_proceeds_are_net_of_wallet_costs() {
+    let mut env = Env::new();
+    env.holding_meme(5_000_000);
+    let u = env.user.pubkey();
+    let cost = solana_system_interface::instruction::transfer(&u, &Pubkey::new_unique(), SOL);
+    let calls = vec![cost, env.curve_ix(0, 0, 5_000_000, 4 * SOL)];
+    let before = env.config().total_credited;
+    let venue = env.relay_many(calls.clone());
+    let ix = env.execute_v2_ix(env.user_meme, env.user_wsol, venue, 3 * SOL + 1, SOL, u64::MAX, SOL);
+    let e = env.send_relayed(ix).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::InsufficientOutput)), "4 SOL in, 1 SOL out: 3 SOL net");
+    let venue = env.relay_many(calls);
+    let ix = env.execute_v2_ix(env.user_meme, env.user_wsol, venue, 3 * SOL, SOL, u64::MAX, SOL);
+    env.send_relayed(ix).unwrap();
+    assert_eq!(env.config().total_credited - before, pct(3 * SOL, 40), "fee on the 3 SOL net");
+    env.assert_solvent();
+}
+
+/// A buy paid partly in wSOL and partly from the wallet: `spent` and the fee are the sum.
+#[test]
+fn review_h1_buy_spent_is_wsol_plus_wallet() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let pay = spl_token_interface::instruction::transfer(&token_program(), &env.user_wsol, &env.pool_wsol, &u, &[], 5 * SOL).unwrap();
+    let calls = vec![pay, env.curve_ix(SOL, 1_000, 0, 0)];
+    let venue = env.relay_many(calls.clone());
+    let ix = env.execute_v2_ix(env.user_wsol, env.user_meme, venue, 1_000, SOL, 6 * SOL - 1, SOL);
+    let e = env.send_relayed(ix).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::InputTooHigh)));
+    let venue = env.relay_many(calls);
+    let ix = env.execute_v2_ix(env.user_wsol, env.user_meme, venue, 1_000, SOL, 6 * SOL, SOL);
+    env.send_relayed(ix).unwrap();
+    assert_eq!(env.config().total_credited, pct(6 * SOL, 40));
+    env.assert_solvent();
+}
+
+/// Review M-2: unsynced lamports in the wSOL output may not be synced into the measured amount and counted as
+/// proceeds (`execute` and `execute_v2`).
+#[test]
+fn review_m2_unsynced_wsol_lamports_cannot_count_as_output() {
+    let mut env = Env::new();
+    let mut a = env.svm.get_account(&env.user_wsol).unwrap();
+    a.lamports += 5 * SOL; // sent to the account, never synced
+    env.svm.set_account(env.user_wsol, a).unwrap();
+    let u = env.user.pubkey();
+    env.token_account(env.user_meme, env.meme, u, 1_000);
+    for v2 in [false, true] {
+        let sync = spl_token_interface::instruction::sync_native(&token_program(), &env.user_wsol).unwrap();
+        let swap = env.venue_ix(&u, env.user_meme, env.user_wsol, env.meme, wsol(), 1_000, 1);
+        let venue = env.relay_many(vec![swap, sync]);
+        let ix = if v2 {
+            env.execute_v2_ix(env.user_meme, env.user_wsol, venue, 5 * SOL, SOL, u64::MAX, 1)
+        } else {
+            env.execute_ix(&u, env.router, env.user_meme, env.user_wsol, venue, 5 * SOL, SOL, i64::MAX)
+        };
+        let e = env.send_relayed(ix).unwrap_err();
+        assert_eq!(custom_code(&e), Some(code(RouterError::AccountLamportsTaken)), "v2={v2}");
+    }
+}
+
+/// Review M-2: a Token-2022 account's surplus lamports may not be withdrawn by the swap (WithdrawExcessLamports).
+#[test]
+fn review_m2_token_account_surplus_lamports_protected() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let t22 = spl_token_2022_interface::ID;
+    let acc = Pubkey::new_unique();
+    let mut data = vec![0u8; TokenAccount::LEN];
+    TokenAccount {
+        mint: env.meme,
+        owner: u,
+        amount: 0,
+        delegate: COption::None,
+        state: AccountState::Initialized,
+        is_native: COption::None,
+        delegated_amount: 0,
+        close_authority: COption::None,
+    }
+    .pack_into_slice(&mut data);
+    let rent = env.svm.minimum_balance_for_rent_exemption(TokenAccount::LEN);
+    env.svm.set_account(acc, Account { lamports: rent + SOL, data, owner: t22, executable: false, rent_epoch: 0 }).unwrap();
+    let thief = Pubkey::new_unique();
+    let take = spl_token_2022_interface::instruction::withdraw_excess_lamports(&t22, &acc, &thief, &u, &[]).unwrap();
+    for v2 in [false, true] {
+        let venue = env.relay(take.clone());
+        let ix = if v2 {
+            env.execute_v2_ix(env.user_wsol, acc, venue, 1, SOL, u64::MAX, 1)
+        } else {
+            env.execute_ix(&u, env.router, env.user_wsol, acc, venue, 1, SOL, i64::MAX)
+        };
+        let e = env.send_relayed(ix).unwrap_err();
+        assert_eq!(custom_code(&e), Some(code(RouterError::AccountLamportsTaken)), "v2={v2}");
+    }
+    assert_eq!(env.lamports(&thief), 0);
+    assert_eq!(env.lamports(&acc), rent + SOL);
+}

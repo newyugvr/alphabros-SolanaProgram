@@ -48,6 +48,8 @@ pub const PROTOCOL_FEE_BPS: u64 = 25;
 /// Most a trader can add: 0.25% of the trade (0.5% total). Fixed forever.
 pub const MAX_TRADER_FEE_BPS: u16 = 25;
 pub const BPS: u64 = 10_000;
+/// Most wallet SOL an `execute_v2` swap may be signed to spend: 100 SOL.
+pub const MAX_WALLET_SPEND: u64 = 100_000_000_000;
 /// Jupiter v6: the one venue whose instruction is checked (its own platform fee must be off).
 pub const JUPITER_V6: Pubkey = pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
 /// Native programs. None is ever a venue, and the swap may never be handed a WRITABLE account any of them owns
@@ -220,94 +222,30 @@ pub mod alphabros_router {
         deadline: i64,
         swap_data: Vec<u8>,
     ) -> Result<()> {
-        require!(Clock::get()?.unix_timestamp <= deadline, RouterError::Expired);
-        require!(min_out > 0, RouterError::ZeroMinOut);
+        execute_swap(ctx, min_out, max_fee, max_input, 0, deadline, swap_data)
+    }
 
-        let in_mint = ctx.accounts.input_account.mint;
-        let out_mint = ctx.accounts.output_account.mint;
-        require_keys_neq!(in_mint, out_mint, RouterError::SameToken);
-        require!(in_mint == WSOL_MINT || out_mint == WSOL_MINT, RouterError::UnpricedPair);
-
-        let swap_program = ctx.accounts.swap_program.key();
-        check_venue(&swap_program, &swap_data, ctx.remaining_accounts)?;
-
-        let user = ctx.accounts.user.key();
-        let input_key = ctx.accounts.input_account.key();
-        let output_key = ctx.accounts.output_account.key();
-        check_swap_accounts(ctx.remaining_accounts, &user, &input_key, &output_key)?;
-
-        let in_before = ctx.accounts.input_account.amount;
-        let out_before = ctx.accounts.output_account.amount;
-        let in_auth = authorities(&ctx.accounts.input_account);
-        let out_auth = authorities(&ctx.accounts.output_account);
-
-        // The swap. Only the user's signature is passed on (any other signer in the transaction is dropped), and the
-        // user's wallet is read-only: the swap can use the user's signature, never move the wallet's SOL.
-        let metas: Vec<AccountMeta> = ctx
-            .remaining_accounts
-            .iter()
-            .map(|a| AccountMeta {
-                pubkey: *a.key,
-                is_signer: a.is_signer && *a.key == user,
-                is_writable: a.is_writable && *a.key != user,
-            })
-            .collect();
-        let mut infos: Vec<AccountInfo<'info>> = ctx.remaining_accounts.to_vec();
-        infos.push(ctx.accounts.swap_program.to_account_info());
-        invoke(&Instruction { program_id: swap_program, accounts: metas, data: swap_data }, &infos)?;
-
-        ctx.accounts.input_account.reload()?;
-        ctx.accounts.output_account.reload()?;
-        // The swap held the user's signature: it may move tokens, but must leave both accounts' owner, delegate and
-        // close authority exactly as they were (no approval or authority change can outlive the transaction).
-        require!(authorities(&ctx.accounts.input_account) == in_auth, RouterError::AccountAuthorityChanged);
-        require!(authorities(&ctx.accounts.output_account) == out_auth, RouterError::AccountAuthorityChanged);
-        let spent = in_before.saturating_sub(ctx.accounts.input_account.amount);
-        let received = ctx.accounts.output_account.amount.saturating_sub(out_before);
-        require!(spent > 0, RouterError::ZeroInput);
-        require!(spent <= max_input, RouterError::InputTooHigh);
-        require!(received >= min_out, RouterError::InsufficientOutput);
-
-        // Exact fee on the wSOL side of what actually moved.
-        let total_bps = PROTOCOL_FEE_BPS + ctx.accounts.router.trader_fee_bps as u64;
-        let sol_side = core::cmp::max(
-            if in_mint == WSOL_MINT { spent } else { 0 },
-            if out_mint == WSOL_MINT { received } else { 0 },
-        );
-        let fee = core::cmp::max(ctx.accounts.config.min_fee, pct(sol_side, total_bps)?);
-        require!(fee <= max_fee, RouterError::FeeTooLow);
-
-        if fee > 0 {
-            invoke(
-                &system_instruction::transfer(&user, &ctx.accounts.vault.key(), fee),
-                &[
-                    ctx.accounts.user.to_account_info(),
-                    ctx.accounts.vault.to_account_info(),
-                    ctx.accounts.system_program.to_account_info(),
-                ],
-            )?;
-        }
-        let protocol_fee = (fee as u128 * PROTOCOL_FEE_BPS as u128 / total_bps as u128) as u64;
-        let trader_fee = fee - protocol_fee;
-        let protocol_wallet = ctx.accounts.config.protocol_wallet;
-        let fee_wallet = ctx.accounts.router.fee_wallet;
-        add_credit(&ctx.accounts.protocol_credit, protocol_wallet, protocol_fee)?;
-        add_credit(&ctx.accounts.trader_credit, fee_wallet, trader_fee)?;
-        let config = &mut ctx.accounts.config;
-        config.total_credited = config.total_credited.checked_add(fee).ok_or(RouterError::MathOverflow)?;
-
-        emit!(Executed {
-            user,
-            router: ctx.accounts.router.key(),
-            input_mint: in_mint,
-            output_mint: out_mint,
-            spent,
-            received,
-            fee,
-            protocol_fee,
-            trader_fee,
-        });
-        Ok(())
+    /// `execute` for venues that trade the wallet's own SOL (bonding curves such as Pump.fun, and AMMs that take a
+    /// SOL fee or rent from the wallet). The wallet is writable in the swap when `max_wallet_spend` is above zero, and
+    /// the swap may take at most `max_wallet_spend` lamports from it (never above `MAX_WALLET_SPEND`). After the swap
+    /// the wallet must still be a plain system account (System-owned, no data): an Assign or Allocate of the wallet
+    /// reverts. Every other rule of `execute` holds.
+    ///
+    /// The wallet's SOL counts on the SOL side, NET: the SOL side is the signed sum of the wSOL account's change and
+    /// the wallet's change, so on a buy `spent` is the net SOL that left both, and on a sell `received` is the net SOL
+    /// that arrived in both (a loss on either side is subtracted, never ignored). `max_input`, `min_out` and the fee
+    /// apply to those net amounts. The router's own fee is taken after this measurement.
+    pub fn execute_v2<'info>(
+        ctx: Context<'info, Execute<'info>>,
+        min_out: u64,
+        max_fee: u64,
+        max_input: u64,
+        max_wallet_spend: u64,
+        deadline: i64,
+        swap_data: Vec<u8>,
+    ) -> Result<()> {
+        require!(max_wallet_spend <= MAX_WALLET_SPEND, RouterError::AboveCap);
+        execute_swap(ctx, min_out, max_fee, max_input, max_wallet_spend, deadline, swap_data)
     }
 
     /// Pays `wallet` everything credited to it. Anyone may trigger it; the lamports only ever go to `wallet`.
@@ -335,6 +273,138 @@ pub mod alphabros_router {
 }
 
 // ============================================================================ helpers
+
+/// The swap behind `execute` (`max_wallet_spend` = 0: the wallet is read-only) and `execute_v2`.
+fn execute_swap<'info>(
+    ctx: Context<'info, Execute<'info>>,
+    min_out: u64,
+    max_fee: u64,
+    max_input: u64,
+    max_wallet_spend: u64,
+    deadline: i64,
+    swap_data: Vec<u8>,
+) -> Result<()> {
+    require!(Clock::get()?.unix_timestamp <= deadline, RouterError::Expired);
+    require!(min_out > 0, RouterError::ZeroMinOut);
+
+    let in_mint = ctx.accounts.input_account.mint;
+    let out_mint = ctx.accounts.output_account.mint;
+    require_keys_neq!(in_mint, out_mint, RouterError::SameToken);
+    require!(in_mint == WSOL_MINT || out_mint == WSOL_MINT, RouterError::UnpricedPair);
+
+    let swap_program = ctx.accounts.swap_program.key();
+    check_venue(&swap_program, &swap_data, ctx.remaining_accounts)?;
+
+    let user = ctx.accounts.user.key();
+    let input_key = ctx.accounts.input_account.key();
+    let output_key = ctx.accounts.output_account.key();
+    check_swap_accounts(ctx.remaining_accounts, &user, &input_key, &output_key)?;
+
+    let in_before = ctx.accounts.input_account.amount;
+    let wallet_before = ctx.accounts.user.lamports();
+    let out_before = ctx.accounts.output_account.amount;
+    let in_auth = authorities(&ctx.accounts.input_account);
+    let out_auth = authorities(&ctx.accounts.output_account);
+    let in_excess = excess_lamports(&ctx.accounts.input_account);
+    let out_excess = excess_lamports(&ctx.accounts.output_account);
+
+    // The swap. Only the user's signature is passed on (any other signer in the transaction is dropped), and the
+    // user's wallet is read-only unless the user signed a wallet spend (`execute_v2`): without one the swap can use
+    // the user's signature, never move the wallet's SOL.
+    let wallet_writable = max_wallet_spend > 0;
+    let metas: Vec<AccountMeta> = ctx
+        .remaining_accounts
+        .iter()
+        .map(|a| AccountMeta {
+            pubkey: *a.key,
+            is_signer: a.is_signer && *a.key == user,
+            is_writable: a.is_writable && (*a.key != user || wallet_writable),
+        })
+        .collect();
+    let mut infos: Vec<AccountInfo<'info>> = ctx.remaining_accounts.to_vec();
+    infos.push(ctx.accounts.swap_program.to_account_info());
+    invoke(&Instruction { program_id: swap_program, accounts: metas, data: swap_data }, &infos)?;
+
+    ctx.accounts.input_account.reload()?;
+    ctx.accounts.output_account.reload()?;
+    // The swap held the user's signature: it may move tokens, but must leave both accounts' owner, delegate and
+    // close authority exactly as they were (no approval or authority change can outlive the transaction).
+    require!(authorities(&ctx.accounts.input_account) == in_auth, RouterError::AccountAuthorityChanged);
+    require!(authorities(&ctx.accounts.output_account) == out_auth, RouterError::AccountAuthorityChanged);
+    // Neither measured account may lose SOL that is not its token amount (rent, surplus lamports, unsynced lamports
+    // of a wSOL account): a swap could otherwise withdraw them, or sync them into the measured amount.
+    require!(excess_lamports(&ctx.accounts.input_account) >= in_excess, RouterError::AccountLamportsTaken);
+    require!(excess_lamports(&ctx.accounts.output_account) >= out_excess, RouterError::AccountLamportsTaken);
+    // The wallet: still a plain system account (no Assign, no Allocate), and at most `max_wallet_spend` lamports
+    // gone.
+    let wallet = ctx.accounts.user.to_account_info();
+    require!(wallet.owner == &NATIVE_PROGRAMS[0] && wallet.data_is_empty(), RouterError::WalletTampered);
+    let wallet_after = wallet.lamports();
+    require!(wallet_before.saturating_sub(wallet_after) <= max_wallet_spend, RouterError::WalletSpendTooHigh);
+    // The SOL side is measured NET: the wSOL account's change plus the wallet's change, signed, so a loss on one
+    // can never hide behind a gain on the other. The token side is the measured account's own change.
+    let wallet_change = wallet_after as i128 - wallet_before as i128;
+    let (spent, received) = if in_mint == WSOL_MINT {
+        let sol_change = ctx.accounts.input_account.amount as i128 - in_before as i128 + wallet_change;
+        let spent = u64::try_from((-sol_change).max(0)).map_err(|_| error!(RouterError::MathOverflow))?;
+        (spent, ctx.accounts.output_account.amount.saturating_sub(out_before))
+    } else {
+        let sol_change = ctx.accounts.output_account.amount as i128 - out_before as i128 + wallet_change;
+        let received = u64::try_from(sol_change.max(0)).map_err(|_| error!(RouterError::MathOverflow))?;
+        (in_before.saturating_sub(ctx.accounts.input_account.amount), received)
+    };
+    require!(spent > 0, RouterError::ZeroInput);
+    require!(spent <= max_input, RouterError::InputTooHigh);
+    require!(received >= min_out, RouterError::InsufficientOutput);
+
+    // Exact fee on the wSOL side of what actually moved.
+    let total_bps = PROTOCOL_FEE_BPS + ctx.accounts.router.trader_fee_bps as u64;
+    let sol_side = core::cmp::max(
+        if in_mint == WSOL_MINT { spent } else { 0 },
+        if out_mint == WSOL_MINT { received } else { 0 },
+    );
+    let fee = core::cmp::max(ctx.accounts.config.min_fee, pct(sol_side, total_bps)?);
+    require!(fee <= max_fee, RouterError::FeeTooLow);
+
+    if fee > 0 {
+        invoke(
+            &system_instruction::transfer(&user, &ctx.accounts.vault.key(), fee),
+            &[
+                ctx.accounts.user.to_account_info(),
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+    }
+    let protocol_fee = (fee as u128 * PROTOCOL_FEE_BPS as u128 / total_bps as u128) as u64;
+    let trader_fee = fee - protocol_fee;
+    let protocol_wallet = ctx.accounts.config.protocol_wallet;
+    let fee_wallet = ctx.accounts.router.fee_wallet;
+    add_credit(&ctx.accounts.protocol_credit, protocol_wallet, protocol_fee)?;
+    add_credit(&ctx.accounts.trader_credit, fee_wallet, trader_fee)?;
+    let config = &mut ctx.accounts.config;
+    config.total_credited = config.total_credited.checked_add(fee).ok_or(RouterError::MathOverflow)?;
+
+    emit!(Executed {
+        user,
+        router: ctx.accounts.router.key(),
+        input_mint: in_mint,
+        output_mint: out_mint,
+        spent,
+        received,
+        fee,
+        protocol_fee,
+        trader_fee,
+    });
+    Ok(())
+}
+
+/// A token account's lamports that are not its token amount: everything for a non-native account, the rent and any
+/// unsynced lamports for a wSOL account.
+fn excess_lamports(a: &InterfaceAccount<TokenAccount>) -> u64 {
+    let lamports = a.to_account_info().lamports();
+    if a.mint == WSOL_MINT { lamports.saturating_sub(a.amount) } else { lamports }
+}
 
 /// `amount` x `bps` / 10,000, rounded up.
 pub fn pct(amount: u64, bps: u64) -> Result<u64> {
@@ -802,4 +872,10 @@ pub enum RouterError {
     JupiterPlatformFee,
     #[msg("A writable account owned by a native program, or a system account holding data, may not be handed to the swap")]
     ProtectedAccount,
+    #[msg("The swap assigned the wallet to a program or gave it data")]
+    WalletTampered,
+    #[msg("The swap took more of the wallet's SOL than max_wallet_spend")]
+    WalletSpendTooHigh,
+    #[msg("The swap took lamports from the measured input or output account beyond its token amount")]
+    AccountLamportsTaken,
 }
