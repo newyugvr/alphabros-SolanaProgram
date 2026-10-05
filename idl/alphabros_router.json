@@ -1,0 +1,1279 @@
+{
+  "address": "9Gv5FLbNg4iKEDK9dM7twBrCjc65KEMpthG3SoYq53Aa",
+  "metadata": {
+    "name": "alphabros_router",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Alphabros V2 fee router for Solana: per-trader routers, exact fee in SOL, swaps through any venue (permissionless)"
+  },
+  "instructions": [
+    {
+      "name": "accept_config_ownership",
+      "discriminator": [
+        6,
+        212,
+        14,
+        48,
+        229,
+        38,
+        62,
+        241
+      ],
+      "accounts": [
+        {
+          "name": "new_owner",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "accept_router_ownership",
+      "discriminator": [
+        78,
+        208,
+        124,
+        196,
+        119,
+        47,
+        153,
+        203
+      ],
+      "accounts": [
+        {
+          "name": "new_owner",
+          "signer": true
+        },
+        {
+          "name": "router",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "collect",
+      "docs": [
+        "Pays `wallet` everything credited to it. Anyone may trigger it; the lamports only ever go to `wallet`."
+      ],
+      "discriminator": [
+        208,
+        47,
+        194,
+        155,
+        17,
+        98,
+        82,
+        236
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "credit",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  114,
+                  101,
+                  100,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "wallet"
+              }
+            ]
+          }
+        },
+        {
+          "name": "wallet",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "create_router",
+      "docs": [
+        "Anyone creates a router. The signer owns it; `fee_wallet` receives the trader's share; the trader fee is fixed",
+        "forever (another rate = another router, with another salt). The fee wallet's credit account is created here,",
+        "paid by the router owner, so no swap ever pays for it."
+      ],
+      "discriminator": [
+        75,
+        219,
+        162,
+        173,
+        199,
+        87,
+        169,
+        123
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "router",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  111,
+                  117,
+                  116,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              },
+              {
+                "kind": "arg",
+                "path": "salt"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "fee_credit",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "fee_wallet",
+          "type": "pubkey"
+        },
+        {
+          "name": "trader_fee_bps",
+          "type": "u16"
+        },
+        {
+          "name": "salt",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "execute",
+      "docs": [
+        "Swap through `router`, paying at most `max_fee` lamports and spending at most `max_input` of the input token.",
+        "",
+        "The swap is `swap_data` sent to `swap_program` (any venue the user signed for, except the blocked ones) with",
+        "`remaining_accounts`, carrying the user's signature. The venue may pass that signature on to the programs it",
+        "calls, so the router BINDS the swap to the measured accounts: among the accounts handed to the swap, the only",
+        "writable token accounts the user owns (or is a delegate of) may be `input_account` and `output_account`, no SPL",
+        "multisig may appear, no account a native program owns may be writable (nor a system account holding data, such",
+        "as a durable nonce), only the user's signature is passed on, and the user's wallet is read-only. The swap",
+        "therefore has nothing of the user's to spend except `input_account`, and it must leave the owner, delegate and",
+        "close authority of both measured accounts unchanged. For Jupiter v6 the instruction must be a route with its",
+        "platform fee off.",
+        "",
+        "After the swap: spent > 0, spent <= max_input, received >= min_out, and the fee is exactly",
+        "max(min_fee, ceil(wSOL side x total bps / 10_000)) from the user's SOL, reverting if above `max_fee`. That fee is",
+        "this router's only SOL debit from the user (no account is created during a swap); network fees and the app's",
+        "wrap/unwrap instructions are outside it. For a SOL trade the app wraps SOL into the user's wSOL account before",
+        "this instruction (and may unwrap after)."
+      ],
+      "discriminator": [
+        130,
+        221,
+        242,
+        154,
+        13,
+        193,
+        189,
+        29
+      ],
+      "accounts": [
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "router"
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "protocol_credit",
+          "writable": true
+        },
+        {
+          "name": "trader_credit",
+          "docs": [
+            "equal `protocol_credit`."
+          ],
+          "writable": true
+        },
+        {
+          "name": "input_account",
+          "docs": [
+            "The user's token account the swap pays from."
+          ],
+          "writable": true
+        },
+        {
+          "name": "output_account",
+          "docs": [
+            "The user's token account the swap pays into."
+          ],
+          "writable": true
+        },
+        {
+          "name": "swap_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "min_out",
+          "type": "u64"
+        },
+        {
+          "name": "max_fee",
+          "type": "u64"
+        },
+        {
+          "name": "max_input",
+          "type": "u64"
+        },
+        {
+          "name": "deadline",
+          "type": "i64"
+        },
+        {
+          "name": "swap_data",
+          "type": "bytes"
+        }
+      ]
+    },
+    {
+      "name": "initialize",
+      "docs": [
+        "One-time setup, by the program's upgrade authority only (so nobody can front-run it after deploy). Creates the",
+        "protocol wallet's credit account here, paid by the deployer, so no swap ever pays for it."
+      ],
+      "discriminator": [
+        175,
+        175,
+        109,
+        31,
+        13,
+        152,
+        155,
+        237
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "protocol_credit",
+          "writable": true
+        },
+        {
+          "name": "program",
+          "address": "9Gv5FLbNg4iKEDK9dM7twBrCjc65KEMpthG3SoYq53Aa"
+        },
+        {
+          "name": "program_data"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "protocol_wallet",
+          "type": "pubkey"
+        },
+        {
+          "name": "min_fee",
+          "type": "u64"
+        },
+        {
+          "name": "max_min_fee",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "set_fee_wallet",
+      "docs": [
+        "Router owner: where future trader shares go (its credit account is created now, paid by the owner). Credits",
+        "already earned stay with the old wallet."
+      ],
+      "discriminator": [
+        108,
+        242,
+        79,
+        79,
+        203,
+        119,
+        109,
+        211
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "router"
+          ]
+        },
+        {
+          "name": "router",
+          "writable": true
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "credit",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "wallet",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "set_min_fee",
+      "docs": [
+        "Config owner: the floor, in lamports, never above the cap fixed at initialize."
+      ],
+      "discriminator": [
+        114,
+        198,
+        35,
+        3,
+        41,
+        196,
+        194,
+        246
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "lamports",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "set_protocol_wallet",
+      "docs": [
+        "Config owner: where future protocol shares go (its credit account is created now, paid by the owner). Credits",
+        "already earned stay with the old wallet."
+      ],
+      "discriminator": [
+        118,
+        54,
+        197,
+        41,
+        122,
+        139,
+        65,
+        174
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "credit",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "wallet",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "transfer_config_ownership",
+      "discriminator": [
+        53,
+        124,
+        67,
+        226,
+        108,
+        130,
+        19,
+        12
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "new_owner",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "transfer_router_ownership",
+      "discriminator": [
+        186,
+        130,
+        145,
+        70,
+        149,
+        176,
+        47,
+        18
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "router"
+          ]
+        },
+        {
+          "name": "router",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "new_owner",
+          "type": "pubkey"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Config",
+      "discriminator": [
+        155,
+        12,
+        170,
+        224,
+        30,
+        250,
+        204,
+        130
+      ]
+    },
+    {
+      "name": "Credit",
+      "discriminator": [
+        6,
+        79,
+        161,
+        136,
+        156,
+        172,
+        190,
+        149
+      ]
+    },
+    {
+      "name": "Router",
+      "discriminator": [
+        94,
+        226,
+        217,
+        169,
+        186,
+        4,
+        198,
+        7
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "Collected",
+      "discriminator": [
+        67,
+        109,
+        138,
+        167,
+        168,
+        239,
+        2,
+        207
+      ]
+    },
+    {
+      "name": "Executed",
+      "discriminator": [
+        8,
+        232,
+        139,
+        132,
+        197,
+        45,
+        29,
+        164
+      ]
+    },
+    {
+      "name": "FeeWalletSet",
+      "discriminator": [
+        66,
+        86,
+        57,
+        187,
+        128,
+        107,
+        162,
+        77
+      ]
+    },
+    {
+      "name": "Initialized",
+      "discriminator": [
+        208,
+        213,
+        115,
+        98,
+        115,
+        82,
+        201,
+        209
+      ]
+    },
+    {
+      "name": "MinFeeSet",
+      "discriminator": [
+        60,
+        127,
+        101,
+        230,
+        216,
+        129,
+        188,
+        98
+      ]
+    },
+    {
+      "name": "ProtocolWalletSet",
+      "discriminator": [
+        144,
+        116,
+        23,
+        95,
+        36,
+        208,
+        159,
+        149
+      ]
+    },
+    {
+      "name": "RouterCreated",
+      "discriminator": [
+        242,
+        77,
+        113,
+        111,
+        202,
+        248,
+        118,
+        3
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "ZeroAddress",
+      "msg": "Address must not be zero or the vault"
+    },
+    {
+      "code": 6001,
+      "name": "AboveCap",
+      "msg": "Value above its cap"
+    },
+    {
+      "code": 6002,
+      "name": "NotUpgradeAuthority",
+      "msg": "Only the program's upgrade authority can initialize"
+    },
+    {
+      "code": 6003,
+      "name": "NotOwner",
+      "msg": "Signer is not the owner"
+    },
+    {
+      "code": 6004,
+      "name": "NotPendingOwner",
+      "msg": "Signer is not the pending owner"
+    },
+    {
+      "code": 6005,
+      "name": "Expired",
+      "msg": "Swap deadline passed"
+    },
+    {
+      "code": 6006,
+      "name": "ZeroMinOut",
+      "msg": "min_out must be above zero"
+    },
+    {
+      "code": 6007,
+      "name": "SameToken",
+      "msg": "Input and output mints are the same"
+    },
+    {
+      "code": 6008,
+      "name": "UnpricedPair",
+      "msg": "Neither side is wSOL, so the trade cannot be priced"
+    },
+    {
+      "code": 6009,
+      "name": "VenueNotAllowed",
+      "msg": "This program can never be a swap venue (the router itself or a native program)"
+    },
+    {
+      "code": 6010,
+      "name": "NotUsersAccount",
+      "msg": "Token account does not belong to the signer"
+    },
+    {
+      "code": 6011,
+      "name": "InsufficientOutput",
+      "msg": "Output below min_out"
+    },
+    {
+      "code": 6012,
+      "name": "FeeTooLow",
+      "msg": "Exact fee is above max_fee"
+    },
+    {
+      "code": 6013,
+      "name": "WrongCreditAccount",
+      "msg": "Wrong credit account"
+    },
+    {
+      "code": 6014,
+      "name": "MathOverflow",
+      "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 6015,
+      "name": "SwapAccountNotBound",
+      "msg": "The swap was handed a writable token account of the user's other than the measured input and output"
+    },
+    {
+      "code": 6016,
+      "name": "ZeroInput",
+      "msg": "Nothing was spent from the measured input account"
+    },
+    {
+      "code": 6017,
+      "name": "InputTooHigh",
+      "msg": "More input was spent than max_input"
+    },
+    {
+      "code": 6018,
+      "name": "CreditAccountMissing",
+      "msg": "The wallet's credit account does not exist yet"
+    },
+    {
+      "code": 6019,
+      "name": "MultisigNotAllowed",
+      "msg": "An SPL multisig account may not be handed to the swap"
+    },
+    {
+      "code": 6020,
+      "name": "AccountAuthorityChanged",
+      "msg": "The swap changed the owner, delegate or close authority of the measured input or output account"
+    },
+    {
+      "code": 6021,
+      "name": "JupiterNotARoute",
+      "msg": "Jupiter instruction is not a route"
+    },
+    {
+      "code": 6022,
+      "name": "JupiterPlatformFee",
+      "msg": "Jupiter's platform fee must be off"
+    },
+    {
+      "code": 6023,
+      "name": "ProtectedAccount",
+      "msg": "A writable account owned by a native program, or a system account holding data, may not be handed to the swap"
+    }
+  ],
+  "types": [
+    {
+      "name": "Collected",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Config",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "protocol_wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "min_fee",
+            "docs": [
+              "Fee floor, lamports. At most `max_min_fee`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_min_fee",
+            "docs": [
+              "Cap on the floor, lamports. Set once at initialize; no setter."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_credited",
+            "docs": [
+              "Sum of all credits; the vault always holds exactly this above its rent reserve."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "vault_bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Credit",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "docs": [
+              "Lamports `wallet` can collect."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Executed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "user",
+            "type": "pubkey"
+          },
+          {
+            "name": "router",
+            "type": "pubkey"
+          },
+          {
+            "name": "input_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "output_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "spent",
+            "type": "u64"
+          },
+          {
+            "name": "received",
+            "type": "u64"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          },
+          {
+            "name": "protocol_fee",
+            "type": "u64"
+          },
+          {
+            "name": "trader_fee",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FeeWalletSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "router",
+            "type": "pubkey"
+          },
+          {
+            "name": "wallet",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Initialized",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "protocol_wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "min_fee",
+            "type": "u64"
+          },
+          {
+            "name": "max_min_fee",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MinFeeSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "lamports",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ProtocolWalletSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "wallet",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Router",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader_fee_bps",
+            "docs": [
+              "Fixed at creation; no setter."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "salt",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RouterCreated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "router",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "trader_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "salt",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
