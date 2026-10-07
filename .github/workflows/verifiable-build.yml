@@ -46,8 +46,8 @@ jobs:
             solana-verify build --library-name mock_swap
             sudo chown -R "$(id -u):$(id -g)" target
           fi
-          cd tests && cargo test --test router 2>&1 | tee ../target/tests.log
-          echo "::notice title=tests::$(grep 'test result' ../target/tests.log | tail -1)"
+          cd tests && cargo test --test router --test v4 2>&1 | tee ../target/tests.log
+          echo "::notice title=tests::$(grep 'test result' ../target/tests.log | paste -sd ' | ')"
 
       - name: Install Anchor CLI 1.2.0
         run: command -v anchor || cargo install --git https://github.com/solana-foundation/anchor --tag v1.2.0 anchor-cli --locked

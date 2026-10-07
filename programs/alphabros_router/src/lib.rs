@@ -1,28 +1,28 @@
-//! Alphabros V2 fee router for Solana.
+//! Alphabros V4 fee router for Solana.
 //!
-//! Anyone creates a router (a small config account) with a trader fee fixed forever. Users swap through a router:
-//! the program runs the swap by CPI into the swap program the user signed for (any venue: Jupiter v6, another
-//! aggregator, a DEX) with the user's own token accounts and signature, measures what actually moved on the user's
-//! accounts, and charges an exact fee in SOL:
+//! One config, owned by the protocol (a Squads vault). Users swap through any venue they choose (Jupiter v6, another
+//! aggregator, a DEX, a bonding curve): the program runs the swap by CPI with the user's own token accounts and
+//! signature, measures what actually moved on the user's accounts (the SOL side net of the wallet's change), and
+//! charges an exact fee in SOL:
 //!
-//!     fee = max(min_fee, ceil(SOL side x (25 + trader_fee_bps) / 10_000))
+//!     fee = max(min_fee, ceil(SOL side x fee_bps / 10_000))
 //!
-//! never above the `max_fee` the user signed. Every swap must have wSOL on one side, so the fee is always priced
-//! on-chain. The fee is credited in the program (protocol 25 / total, the router's fee wallet the rest) and each
-//! wallet collects its own credit later; nothing is pushed during a swap. This router's only SOL debit from the user
-//! is that fee, capped by `max_fee`: credit accounts are created (and paid for) when a wallet is set, never during a
-//! swap. Network fees and the user's own wrap/unwrap instructions are outside the program.
+//! never above the `max_fee` the user signed. The owner sets `fee_bps` (never above 0.5%, a constant). A trade may
+//! name a community and a referral: one payee share of the fee (never above 60%, a constant) goes whole to the one
+//! named, split by the owner's community split when both are; the protocol gets the rest. Communities and referrals
+//! register with the SAME EIP-712 signature (the owner's EVM key) as on the EVM router, so one signature serves every
+//! chain. Every fee is credited in the program and each wallet collects its own credit later; nothing is pushed during
+//! a swap.
 //!
-//! Venues are permissionless: there is no allowlist to govern. The user signs the transaction and so chooses the venue;
-//! what makes any venue safe to call is what `execute` enforces around it (the swap is bound to the measured accounts,
-//! only the user's signature is passed on, the user's SOL wallet and native-program accounts are out of reach, no
-//! approval or authority change survives, spent <= max_input, received >= min_out). A short block list refuses
-//! programs that are never venues (this program itself and the native programs). When the venue is Jupiter v6, its own
-//! platform fee must be off, so no fee is taken beside this router's.
-//!
-//! Who can change what: the config owner sets the floor (never above `max_min_fee`, fixed at initialize) and the
-//! protocol wallet. A router's owner sets its fee wallet. Nobody can change the fee rates, the cap, a router's trader
-//! fee, or move a user's tokens or anyone's credit.
+//! Venues are permissionless: the user signs the transaction and so chooses the venue. What makes a venue safe to call
+//! is what `execute_v4` enforces around it: the swap is bound to the measured accounts (no other writable token account
+//! the user owns, delegates or can close; no writable mint naming the user as an authority, and no other account of a
+//! mint through which the user can act on accounts it does not own), only the user's signature is passed on, native
+//! program accounts and the wallet are out of reach (the wallet only within a signed `max_wallet_spend`), no approval
+//! or authority change survives, spent <= max_input, received >= min_out. The router itself and the native programs
+//! are never venues; when the venue is Jupiter v6 its own platform fee must be off. A venue can still act on other
+//! programs' accounts the user hands it and signs for: the user's choice of venue is the trust boundary.
+
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
@@ -43,12 +43,8 @@ solana_security_txt::security_txt! {
 
 declare_id!("9Gv5FLbNg4iKEDK9dM7twBrCjc65KEMpthG3SoYq53Aa");
 
-/// Protocol fee: 0.25% of the trade. Fixed forever.
-pub const PROTOCOL_FEE_BPS: u64 = 25;
-/// Most a trader can add: 0.25% of the trade (0.5% total). Fixed forever.
-pub const MAX_TRADER_FEE_BPS: u16 = 25;
 pub const BPS: u64 = 10_000;
-/// Most wallet SOL an `execute_v2` swap may be signed to spend: 100 SOL.
+/// Most wallet SOL a swap may be signed to spend (`max_wallet_spend`): 100 SOL.
 pub const MAX_WALLET_SPEND: u64 = 100_000_000_000;
 /// Jupiter v6: the one venue whose instruction is checked (its own platform fee must be off).
 pub const JUPITER_V6: Pubkey = pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
@@ -69,40 +65,77 @@ pub const NATIVE_PROGRAMS: [Pubkey; 9] = [
 /// Wrapped SOL: the only mint the program can value itself (1 token unit = 1 lamport).
 pub const WSOL_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
 
-pub const CONFIG_SEED: &[u8] = b"config";
-pub const VAULT_SEED: &[u8] = b"vault";
-pub const ROUTER_SEED: &[u8] = b"router";
-pub const CREDIT_SEED: &[u8] = b"credit";
+pub const CONFIG_V4_SEED: &[u8] = b"config_v4";
+pub const VAULT_V4_SEED: &[u8] = b"vault_v4";
+pub const CREDIT_V4_SEED: &[u8] = b"credit_v4";
+pub const PAYEE_SEED: &[u8] = b"payee";
+/// Most the V4 fee rate can ever be: 0.5% of the trade's SOL side. Fixed forever.
+pub const MAX_FEE_BPS_V4: u16 = 50;
+/// Most the V4 payee share (community + referral together) can ever be: 60% of the fee. Fixed forever.
+pub const MAX_PAYEE_SHARE_BPS: u16 = 6_000;
+pub const COMMUNITY: u8 = 1;
+pub const REFERRAL: u8 = 2;
+/// The EVM V4 router's EIP-712 domain separator ("Alphabros", "4", its address 0xF5502aa5…de90; no chain ID). The
+/// same on every EVM chain, so one Registration signature serves every EVM chain and Solana.
+pub const EIP712_DOMAIN: [u8; 32] = hex32("93f6f0660059798bc0d68765462e6e0bef950fb63219a50322304039d684ea44");
+/// keccak256("Registration(uint8 kind,address owner,bytes32 name,address wallet,bytes32 solanaWallet,uint64 version)")
+pub const REGISTRATION_TYPEHASH: [u8; 32] = hex32("be037f4fad9aa46fa7a3c389bb1b2e428a0890d414d12a158f625e8b0d90e06d");
+/// secp256k1 n / 2: signatures with a higher s are refused (no malleable duplicates), as on EVM.
+const HALF_N: [u8; 32] = hex32("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0");
+
+const fn hex32(h: &str) -> [u8; 32] {
+    let b = h.as_bytes();
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = (nib(b[2 * i]) << 4) | nib(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+const fn nib(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => panic!("bad hex"),
+    }
+}
 
 #[program]
 pub mod alphabros_router {
     use super::*;
 
-    /// One-time setup, by the program's upgrade authority only (so nobody can front-run it after deploy). Creates the
-    /// protocol wallet's credit account here, paid by the deployer, so no swap ever pays for it.
-    pub fn initialize(
-        ctx: Context<Initialize>,
+
+    /// One-time V4 setup, by the program's upgrade authority only. The fee rate (at most 0.5%), the payee share (at
+    /// most 60% of the fee) and the community split (when a trade names both payees) are the starting values; the
+    /// owner changes them later, never above the caps. Creates the protocol wallet's V4 credit account.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_v4(
+        ctx: Context<InitializeV4>,
         owner: Pubkey,
         protocol_wallet: Pubkey,
         min_fee: u64,
         max_min_fee: u64,
+        fee_bps: u16,
+        payee_share_bps: u16,
+        community_split_bps: u16,
     ) -> Result<()> {
         require_keys_neq!(owner, Pubkey::default(), RouterError::ZeroAddress);
         check_wallet(&protocol_wallet, &ctx.accounts.vault.key())?;
         require!(min_fee <= max_min_fee, RouterError::AboveCap);
-
+        check_v4_rates(fee_bps, payee_share_bps, community_split_bps)?;
         let config = &mut ctx.accounts.config;
         config.owner = owner;
         config.pending_owner = Pubkey::default();
         config.protocol_wallet = protocol_wallet;
         config.min_fee = min_fee;
         config.max_min_fee = max_min_fee;
+        config.fee_bps = fee_bps;
+        config.payee_share_bps = payee_share_bps;
+        config.community_split_bps = community_split_bps;
         config.total_credited = 0;
         config.bump = ctx.bumps.config;
         config.vault_bump = ctx.bumps.vault;
-
-        // The vault holds credited fees as lamports. Fund it to rent exemption once, so paying out a credit can never
-        // take it below the rent minimum; `total_credited` never counts this reserve.
         let rent_min = Rent::get()?.minimum_balance(0);
         let have = ctx.accounts.vault.lamports();
         if have < rent_min {
@@ -115,205 +148,403 @@ pub mod alphabros_router {
                 ],
             )?;
         }
-        ensure_credit(&ctx.accounts.protocol_credit, protocol_wallet, &ctx.accounts.payer, &ctx.accounts.system_program)?;
-
-        emit!(Initialized { owner, protocol_wallet, min_fee, max_min_fee });
+        ensure_credit_in(CREDIT_V4_SEED, &ctx.accounts.protocol_credit, protocol_wallet, &ctx.accounts.payer, &ctx.accounts.system_program)?;
+        emit!(V4Settings { owner, protocol_wallet, min_fee, fee_bps, payee_share_bps, community_split_bps });
         Ok(())
     }
 
-    /// Anyone creates a router. The signer owns it; `fee_wallet` receives the trader's share; the trader fee is fixed
-    /// forever (another rate = another router, with another salt). The fee wallet's credit account is created here,
-    /// paid by the router owner, so no swap ever pays for it.
-    pub fn create_router(
-        ctx: Context<CreateRouter>,
-        fee_wallet: Pubkey,
-        trader_fee_bps: u16,
-        salt: [u8; 32],
-    ) -> Result<()> {
-        require!(trader_fee_bps <= MAX_TRADER_FEE_BPS, RouterError::AboveCap);
-        check_wallet(&fee_wallet, &ctx.accounts.vault.key())?;
-        ensure_credit(&ctx.accounts.fee_credit, fee_wallet, &ctx.accounts.owner, &ctx.accounts.system_program)?;
-        let router = &mut ctx.accounts.router;
-        router.owner = ctx.accounts.owner.key();
-        router.pending_owner = Pubkey::default();
-        router.fee_wallet = fee_wallet;
-        router.trader_fee_bps = trader_fee_bps;
-        router.salt = salt;
-        router.bump = ctx.bumps.router;
-        emit!(RouterCreated { router: router.key(), owner: router.owner, fee_wallet, trader_fee_bps, salt });
+    /// The fee rate, in basis points of the trade's SOL side (30 = 0.3%); at most 0.5%. A user signs `max_fee`, so a
+    /// raise never takes more than that.
+    pub fn set_fee_bps_v4(ctx: Context<ConfigV4OwnerOnly>, fee_bps: u16) -> Result<()> {
+        let c = &mut ctx.accounts.config;
+        check_v4_rates(fee_bps, c.payee_share_bps, c.community_split_bps)?;
+        c.fee_bps = fee_bps;
+        emit_v4_settings(c);
         Ok(())
     }
 
-    /// Router owner: where future trader shares go (its credit account is created now, paid by the owner). Credits
-    /// already earned stay with the old wallet.
-    pub fn set_fee_wallet(ctx: Context<SetFeeWallet>, wallet: Pubkey) -> Result<()> {
+    /// The payee share (basis points of the fee, at most 60%) and the community's part of it when a trade names both
+    /// payees (basis points of the share). Applies to fees settled from now on.
+    pub fn set_shares_v4(ctx: Context<ConfigV4OwnerOnly>, payee_share_bps: u16, community_split_bps: u16) -> Result<()> {
+        let c = &mut ctx.accounts.config;
+        check_v4_rates(c.fee_bps, payee_share_bps, community_split_bps)?;
+        c.payee_share_bps = payee_share_bps;
+        c.community_split_bps = community_split_bps;
+        emit_v4_settings(c);
+        Ok(())
+    }
+
+    /// The floor, lamports; at most the cap fixed at `initialize_v4`.
+    pub fn set_min_fee_v4(ctx: Context<ConfigV4OwnerOnly>, lamports: u64) -> Result<()> {
+        let c = &mut ctx.accounts.config;
+        require!(lamports <= c.max_min_fee, RouterError::AboveCap);
+        c.min_fee = lamports;
+        emit_v4_settings(c);
+        Ok(())
+    }
+
+    /// Future protocol fees go to `wallet`; what the old wallet earned stays its own to collect. Creates the new
+    /// wallet's V4 credit account (paid by the owner) so no swap ever pays for it.
+    pub fn set_protocol_wallet_v4(ctx: Context<SetProtocolWalletV4>, wallet: Pubkey) -> Result<()> {
         check_wallet(&wallet, &ctx.accounts.vault.key())?;
-        ensure_credit(&ctx.accounts.credit, wallet, &ctx.accounts.owner, &ctx.accounts.system_program)?;
-        ctx.accounts.router.fee_wallet = wallet;
-        emit!(FeeWalletSet { router: ctx.accounts.router.key(), wallet });
+        ensure_credit_in(CREDIT_V4_SEED, &ctx.accounts.wallet_credit, wallet, &ctx.accounts.owner, &ctx.accounts.system_program)?;
+        let c = &mut ctx.accounts.config;
+        c.protocol_wallet = wallet;
+        emit_v4_settings(c);
         Ok(())
     }
 
-    pub fn transfer_router_ownership(ctx: Context<RouterOwnerOnly>, new_owner: Pubkey) -> Result<()> {
-        ctx.accounts.router.pending_owner = new_owner;
-        Ok(())
-    }
-
-    pub fn accept_router_ownership(ctx: Context<AcceptRouterOwnership>) -> Result<()> {
-        let router = &mut ctx.accounts.router;
-        router.owner = ctx.accounts.new_owner.key();
-        router.pending_owner = Pubkey::default();
-        Ok(())
-    }
-
-    /// Config owner: the floor, in lamports, never above the cap fixed at initialize.
-    pub fn set_min_fee(ctx: Context<ConfigOwnerOnly>, lamports: u64) -> Result<()> {
-        let config = &mut ctx.accounts.config;
-        require!(lamports <= config.max_min_fee, RouterError::AboveCap);
-        config.min_fee = lamports;
-        emit!(MinFeeSet { lamports });
-        Ok(())
-    }
-
-    /// Config owner: where future protocol shares go (its credit account is created now, paid by the owner). Credits
-    /// already earned stay with the old wallet.
-    pub fn set_protocol_wallet(ctx: Context<SetProtocolWallet>, wallet: Pubkey) -> Result<()> {
-        check_wallet(&wallet, &ctx.accounts.vault.key())?;
-        ensure_credit(&ctx.accounts.credit, wallet, &ctx.accounts.owner, &ctx.accounts.system_program)?;
-        ctx.accounts.config.protocol_wallet = wallet;
-        emit!(ProtocolWalletSet { wallet });
-        Ok(())
-    }
-
-    pub fn transfer_config_ownership(ctx: Context<ConfigOwnerOnly>, new_owner: Pubkey) -> Result<()> {
+    pub fn transfer_ownership_v4(ctx: Context<ConfigV4OwnerOnly>, new_owner: Pubkey) -> Result<()> {
         ctx.accounts.config.pending_owner = new_owner;
         Ok(())
     }
 
-    pub fn accept_config_ownership(ctx: Context<AcceptConfigOwnership>) -> Result<()> {
-        let config = &mut ctx.accounts.config;
-        config.owner = ctx.accounts.new_owner.key();
-        config.pending_owner = Pubkey::default();
+    pub fn accept_ownership_v4(ctx: Context<AcceptOwnershipV4>) -> Result<()> {
+        let c = &mut ctx.accounts.config;
+        c.owner = c.pending_owner;
+        c.pending_owner = Pubkey::default();
         Ok(())
     }
 
-    /// Swap through `router`, paying at most `max_fee` lamports and spending at most `max_input` of the input token.
-    ///
-    /// The swap is `swap_data` sent to `swap_program` (any venue the user signed for, except the blocked ones) with
-    /// `remaining_accounts`, carrying the user's signature. The venue may pass that signature on to the programs it
-    /// calls, so the router BINDS the swap to the measured accounts: among the accounts handed to the swap, the only
-    /// writable token accounts the user owns (or is a delegate of) may be `input_account` and `output_account`, no SPL
-    /// multisig may appear, no account a native program owns may be writable (nor a system account holding data, such
-    /// as a durable nonce), only the user's signature is passed on, and the user's wallet is read-only. The swap
-    /// therefore has nothing of the user's to spend except `input_account`, and it must leave the owner, delegate and
-    /// close authority of both measured accounts unchanged. For Jupiter v6 the instruction must be a route with its
-    /// platform fee off.
-    ///
-    /// After the swap: spent > 0, spent <= max_input, received >= min_out, and the fee is exactly
-    /// max(min_fee, ceil(wSOL side x total bps / 10_000)) from the user's SOL, reverting if above `max_fee`. That fee is
-    /// this router's only SOL debit from the user (no account is created during a swap); network fees and the app's
-    /// wrap/unwrap instructions are outside it. For a SOL trade the app wraps SOL into the user's wSOL account before
-    /// this instruction (and may unwrap after).
-    pub fn execute<'info>(
-        ctx: Context<'info, Execute<'info>>,
-        min_out: u64,
-        max_fee: u64,
-        max_input: u64,
-        deadline: i64,
-        swap_data: Vec<u8>,
-    ) -> Result<()> {
-        execute_swap(ctx, min_out, max_fee, max_input, 0, deadline, swap_data)
+    /// Stores a community's or referral's signed registration (anyone may send it; only the owner's EVM signature,
+    /// the same EIP-712 message the EVM router checks, makes it valid). The payee account is created on first use,
+    /// paid by `payer`. A version at or below the stored one changes nothing; a higher one moves the payout wallet
+    /// (what is already earned is then collected to the new wallet).
+    pub fn register_payee(ctx: Context<RegisterPayee>, reg: Registration) -> Result<()> {
+        require!(reg.kind == COMMUNITY || reg.kind == REFERRAL, RouterError::BadRegistration);
+        require!(reg.owner != [0u8; 20] && reg.version > 0, RouterError::BadRegistration);
+        require!(reg.solana_wallet != Pubkey::default(), RouterError::BadRegistration);
+        let id = payee_id(reg.kind, &reg.owner, &reg.name);
+        let (expected, bump) = Pubkey::find_program_address(&[PAYEE_SEED, &id], &crate::ID);
+        let info = ctx.accounts.payee.to_account_info();
+        require_keys_eq!(info.key(), expected, RouterError::PayeeMismatch);
+        require!(reg.solana_wallet != expected && reg.solana_wallet != ctx.accounts.vault.key(), RouterError::BadRegistration);
+
+        if info.owner == &crate::ID {
+            let stored = Payee::try_deserialize(&mut &info.try_borrow_data()?[..])?;
+            if reg.version <= stored.version {
+                return Ok(()); // this version, or a newer one, is already here
+            }
+        }
+        verify_registration(&reg)?;
+
+        if info.owner != &crate::ID {
+            let space = 8 + Payee::INIT_SPACE;
+            let seeds: &[&[u8]] = &[PAYEE_SEED, &id, &[bump]];
+            let need = Rent::get()?.minimum_balance(space).saturating_sub(info.lamports());
+            if need > 0 {
+                invoke(
+                    &system_instruction::transfer(&ctx.accounts.payer.key(), &expected, need),
+                    &[ctx.accounts.payer.to_account_info(), info.clone(), ctx.accounts.system_program.to_account_info()],
+                )?;
+            }
+            invoke_signed(&system_instruction::allocate(&expected, space as u64), &[info.clone(), ctx.accounts.system_program.to_account_info()], &[seeds])?;
+            invoke_signed(&system_instruction::assign(&expected, &crate::ID), &[info.clone(), ctx.accounts.system_program.to_account_info()], &[seeds])?;
+            let p = Payee { kind: reg.kind, owner: reg.owner, name: reg.name, wallet: reg.solana_wallet, version: reg.version, amount: 0, bump };
+            let mut data = info.try_borrow_mut_data()?;
+            let mut w: &mut [u8] = &mut data[..];
+            p.try_serialize(&mut w)?;
+        } else {
+            let mut data = info.try_borrow_mut_data()?;
+            let mut p = Payee::try_deserialize(&mut &data[..])?;
+            p.wallet = reg.solana_wallet;
+            p.version = reg.version;
+            let mut w: &mut [u8] = &mut data[..];
+            p.try_serialize(&mut w)?;
+        }
+        emit!(PayeeRegistered { id, kind: reg.kind, owner: reg.owner, name: reg.name, wallet: reg.solana_wallet, version: reg.version });
+        Ok(())
     }
 
-    /// `execute` for venues that trade the wallet's own SOL (bonding curves such as Pump.fun, and AMMs that take a
-    /// SOL fee or rent from the wallet). The wallet is writable in the swap when `max_wallet_spend` is above zero, and
-    /// the swap may take at most `max_wallet_spend` lamports from it (never above `MAX_WALLET_SPEND`). After the swap
-    /// the wallet must still be a plain system account (System-owned, no data): an Assign or Allocate of the wallet
-    /// reverts. Every other rule of `execute` holds.
-    ///
-    /// The wallet's SOL counts on the SOL side, NET: the SOL side is the signed sum of the wSOL account's change and
-    /// the wallet's change, so on a buy `spent` is the net SOL that left both, and on a sell `received` is the net SOL
-    /// that arrived in both (a loss on either side is subtracted, never ignored). `max_input`, `min_out` and the fee
-    /// apply to those net amounts. The router's own fee is taken after this measurement.
-    pub fn execute_v2<'info>(
-        ctx: Context<'info, Execute<'info>>,
+    /// The swap: the user signs `max_wallet_spend` (0 keeps the wallet read-only; above zero, only bonding-curve style
+    /// venues that trade the wallet's own SOL need it, and the wallet must stay a plain system account), the fee
+    /// (max(floor, SOL side x fee rate), at most `max_fee`), and the payee share to the community and/or referral the
+    /// trade names. Each named payee must be registered as its kind with exactly the wallet the trade expects, or the
+    /// swap reverts; a payee whose wallet is the user or the protocol wallet earns nothing. Pass the payee accounts as
+    /// `community_payee` / `referral_payee` (or none).
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_v4<'info>(
+        ctx: Context<'info, ExecuteV4<'info>>,
         min_out: u64,
         max_fee: u64,
         max_input: u64,
         max_wallet_spend: u64,
         deadline: i64,
         swap_data: Vec<u8>,
+        community: Option<Party>,
+        referral: Option<Party>,
     ) -> Result<()> {
         require!(max_wallet_spend <= MAX_WALLET_SPEND, RouterError::AboveCap);
-        execute_swap(ctx, min_out, max_fee, max_input, max_wallet_spend, deadline, swap_data)
+        let user = ctx.accounts.user.key();
+        let protocol_wallet = ctx.accounts.config.protocol_wallet;
+        // Cross-check both payees before anything moves.
+        let comm = resolve_payee(ctx.accounts.community_payee.as_ref(), community.as_ref(), COMMUNITY, &user, &protocol_wallet)?;
+        let refr = resolve_payee(ctx.accounts.referral_payee.as_ref(), referral.as_ref(), REFERRAL, &user, &protocol_wallet)?;
+
+        let m = measured_swap(
+            &ctx.accounts.user,
+            &mut ctx.accounts.input_account,
+            &mut ctx.accounts.output_account,
+            &ctx.accounts.swap_program,
+            ctx.remaining_accounts,
+            SwapLimits { min_out, max_input, max_wallet_spend, deadline },
+            swap_data,
+        )?;
+
+        let c = &ctx.accounts.config;
+        let sol_side = core::cmp::max(
+            if m.in_mint == WSOL_MINT { m.spent } else { 0 },
+            if m.out_mint == WSOL_MINT { m.received } else { 0 },
+        );
+        let fee = core::cmp::max(c.min_fee, pct(sol_side, c.fee_bps as u64)?);
+        require!(fee <= max_fee, RouterError::FeeTooLow);
+        if fee > 0 {
+            invoke(
+                &system_instruction::transfer(&user, &ctx.accounts.vault.key(), fee),
+                &[
+                    ctx.accounts.user.to_account_info(),
+                    ctx.accounts.vault.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+        // One payee share: all of it to the payee that earns, split by the community split when both do.
+        let pool = (fee as u128 * c.payee_share_bps as u128 / BPS as u128) as u64;
+        let (community_fee, referral_fee) = match (comm.earns, refr.earns) {
+            (true, true) => {
+                let cf = (pool as u128 * c.community_split_bps as u128 / BPS as u128) as u64;
+                (cf, pool - cf)
+            }
+            (true, false) => (pool, 0),
+            (false, true) => (0, pool),
+            (false, false) => (0, 0),
+        };
+        let protocol_fee = fee - community_fee - referral_fee;
+        if community_fee > 0 {
+            add_payee_credit(ctx.accounts.community_payee.as_ref(), community_fee)?;
+        }
+        if referral_fee > 0 {
+            add_payee_credit(ctx.accounts.referral_payee.as_ref(), referral_fee)?;
+        }
+        add_credit_in(CREDIT_V4_SEED, &ctx.accounts.protocol_credit, protocol_wallet, protocol_fee)?;
+        let config = &mut ctx.accounts.config;
+        config.total_credited = config.total_credited.checked_add(fee).ok_or(RouterError::MathOverflow)?;
+
+        emit!(FeePaid {
+            user,
+            community_id: comm.id,
+            referral_id: refr.id,
+            community_wallet: if community_fee > 0 { comm.wallet } else { Pubkey::default() },
+            referral_wallet: if referral_fee > 0 { refr.wallet } else { Pubkey::default() },
+            fee,
+            protocol_fee,
+            community_fee,
+            referral_fee,
+            input_mint: m.in_mint,
+            output_mint: m.out_mint,
+            spent: m.spent,
+            received: m.received,
+        });
+        Ok(())
     }
 
-    /// Pays `wallet` everything credited to it. Anyone may trigger it; the lamports only ever go to `wallet`.
-    pub fn collect(ctx: Context<Collect>) -> Result<()> {
+    /// Pays a community or referral everything it earned, to its current payout wallet. Anyone may trigger it.
+    pub fn collect_payee(ctx: Context<CollectPayee>) -> Result<()> {
+        let amount = ctx.accounts.payee.amount;
+        if amount == 0 {
+            return Ok(());
+        }
+        ctx.accounts.payee.amount = 0;
+        pay_from_v4_vault(&mut ctx.accounts.config, &ctx.accounts.vault, &ctx.accounts.wallet, &ctx.accounts.system_program, amount)?;
+        emit!(Collected { wallet: ctx.accounts.wallet.key(), amount });
+        Ok(())
+    }
+
+    /// Pays a wallet its V4 credit (the protocol wallet's fees). Anyone may trigger it; the lamports only go to `wallet`.
+    pub fn collect_v4(ctx: Context<CollectV4>) -> Result<()> {
         let amount = ctx.accounts.credit.amount;
         if amount == 0 {
             return Ok(());
         }
         ctx.accounts.credit.amount = 0;
-        let config = &mut ctx.accounts.config;
-        config.total_credited = config.total_credited.checked_sub(amount).ok_or(RouterError::MathOverflow)?;
-        let vault_bump = config.vault_bump;
-        invoke_signed(
-            &system_instruction::transfer(&ctx.accounts.vault.key(), &ctx.accounts.wallet.key(), amount),
-            &[
-                ctx.accounts.vault.to_account_info(),
-                ctx.accounts.wallet.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-            &[&[VAULT_SEED, &[vault_bump]]],
-        )?;
+        pay_from_v4_vault(&mut ctx.accounts.config, &ctx.accounts.vault, &ctx.accounts.wallet, &ctx.accounts.system_program, amount)?;
         emit!(Collected { wallet: ctx.accounts.wallet.key(), amount });
         Ok(())
     }
 }
 
+// ============================================================================ V4 helpers
+
+fn check_v4_rates(fee_bps: u16, payee_share_bps: u16, community_split_bps: u16) -> Result<()> {
+    require!(fee_bps <= MAX_FEE_BPS_V4, RouterError::AboveCap);
+    require!(payee_share_bps <= MAX_PAYEE_SHARE_BPS, RouterError::AboveCap);
+    require!(community_split_bps as u64 <= BPS, RouterError::AboveCap);
+    Ok(())
+}
+
+fn emit_v4_settings(c: &ConfigV4) {
+    emit!(V4Settings {
+        owner: c.owner,
+        protocol_wallet: c.protocol_wallet,
+        min_fee: c.min_fee,
+        fee_bps: c.fee_bps,
+        payee_share_bps: c.payee_share_bps,
+        community_split_bps: c.community_split_bps,
+    });
+}
+
+fn keccak(parts: &[&[u8]]) -> [u8; 32] {
+    solana_keccak_hasher::hashv(parts).to_bytes()
+}
+
+/// A 32-byte ABI word holding `bytes` right-aligned (uint8, address, uint64).
+fn word(bytes: &[u8]) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[32 - bytes.len()..].copy_from_slice(bytes);
+    w
+}
+
+/// keccak256(abi.encode(uint8 kind, address owner, bytes32 name)): the EVM router's `payeeId`, the same ID everywhere.
+pub fn payee_id(kind: u8, owner: &[u8; 20], name: &[u8; 32]) -> [u8; 32] {
+    keccak(&[&word(&[kind]), &word(owner), name])
+}
+
+/// The EIP-712 digest of `reg`, exactly as the EVM router's `registrationDigest`.
+pub fn registration_digest(reg: &Registration) -> [u8; 32] {
+    let struct_hash = keccak(&[
+        &REGISTRATION_TYPEHASH,
+        &word(&[reg.kind]),
+        &word(&reg.owner),
+        &reg.name,
+        &word(&reg.evm_wallet),
+        reg.solana_wallet.as_ref(),
+        &word(&reg.version.to_be_bytes()),
+    ]);
+    keccak(&[&[0x19, 0x01], &EIP712_DOMAIN, &struct_hash])
+}
+
+/// The owner's (r, s, v) signature over the registration: low s, v 27/28, signer = `reg.owner`.
+fn verify_registration(reg: &Registration) -> Result<()> {
+    let sig = &reg.signature;
+    let v = sig[64];
+    require!(v == 27 || v == 28, RouterError::BadSignature);
+    require!(sig[32..64] <= HALF_N[..], RouterError::BadSignature);
+    let digest = registration_digest(reg);
+    let pubkey = solana_secp256k1_recover::secp256k1_recover(&digest, v - 27, &sig[..64])
+        .map_err(|_| error!(RouterError::BadSignature))?;
+    let addr = keccak(&[&pubkey.to_bytes()]);
+    require!(addr[12..] == reg.owner[..], RouterError::BadSignature);
+    Ok(())
+}
+
+/// A payee a trade names, after the cross-check.
+struct Resolved {
+    id: [u8; 32],
+    wallet: Pubkey,
+    earns: bool,
+}
+
+/// Checks the payee account against the party the trade names: the PDA of its ID, owned by this program, of `kind`,
+/// with exactly the expected wallet. No party: nobody (the account, if passed, is ignored).
+fn resolve_payee(account: Option<&UncheckedAccount>, party: Option<&Party>, kind: u8, user: &Pubkey, protocol_wallet: &Pubkey) -> Result<Resolved> {
+    let Some(party) = party else { return Ok(Resolved { id: [0u8; 32], wallet: Pubkey::default(), earns: false }) };
+    let info = account.ok_or(error!(RouterError::PayeeMismatch))?.to_account_info();
+    let (expected, _) = Pubkey::find_program_address(&[PAYEE_SEED, &party.id], &crate::ID);
+    require_keys_eq!(info.key(), expected, RouterError::PayeeMismatch);
+    require_keys_eq!(*info.owner, crate::ID, RouterError::PayeeMismatch);
+    let p = Payee::try_deserialize(&mut &info.try_borrow_data()?[..]).map_err(|_| error!(RouterError::PayeeMismatch))?;
+    require!(p.kind == kind && p.wallet == party.wallet, RouterError::PayeeMismatch);
+    let earns = p.wallet != *user && p.wallet != *protocol_wallet;
+    Ok(Resolved { id: party.id, wallet: p.wallet, earns })
+}
+
+fn add_payee_credit(account: Option<&UncheckedAccount>, amount: u64) -> Result<()> {
+    let info = account.ok_or(error!(RouterError::PayeeMismatch))?.to_account_info();
+    let mut data = info.try_borrow_mut_data()?;
+    let mut p = Payee::try_deserialize(&mut &data[..])?;
+    p.amount = p.amount.checked_add(amount).ok_or(RouterError::MathOverflow)?;
+    let mut w: &mut [u8] = &mut data[..];
+    p.try_serialize(&mut w)?;
+    Ok(())
+}
+
+fn pay_from_v4_vault<'info>(
+    config: &mut Account<'info, ConfigV4>,
+    vault: &UncheckedAccount<'info>,
+    wallet: &UncheckedAccount<'info>,
+    system_program: &Program<'info, System>,
+    amount: u64,
+) -> Result<()> {
+    config.total_credited = config.total_credited.checked_sub(amount).ok_or(RouterError::MathOverflow)?;
+    let vault_bump = config.vault_bump;
+    invoke_signed(
+        &system_instruction::transfer(&vault.key(), &wallet.key(), amount),
+        &[vault.to_account_info(), wallet.to_account_info(), system_program.to_account_info()],
+        &[&[VAULT_V4_SEED, &[vault_bump]]],
+    )
+    .map_err(Into::into)
+}
+
 // ============================================================================ helpers
 
-/// The swap behind `execute` (`max_wallet_spend` = 0: the wallet is read-only) and `execute_v2`.
-fn execute_swap<'info>(
-    ctx: Context<'info, Execute<'info>>,
+/// What a swap may do: the user's signed limits.
+struct SwapLimits {
     min_out: u64,
-    max_fee: u64,
     max_input: u64,
     max_wallet_spend: u64,
     deadline: i64,
+}
+
+/// What a swap actually moved, measured on the user's accounts (the SOL side NET of the wallet's change).
+struct Measured {
+    in_mint: Pubkey,
+    out_mint: Pubkey,
+    spent: u64,
+    received: u64,
+}
+
+/// The swap shared by every version: checks the venue and the accounts handed to it, runs it with only the user's
+/// signature (the wallet writable only within a signed wallet spend), then measures what moved and enforces the
+/// limits. Settling the fee is the caller's.
+fn measured_swap<'info>(
+    user_acc: &Signer<'info>,
+    input: &mut Box<InterfaceAccount<'info, TokenAccount>>,
+    output: &mut Box<InterfaceAccount<'info, TokenAccount>>,
+    venue: &UncheckedAccount<'info>,
+    remaining: &[AccountInfo<'info>],
+    limits: SwapLimits,
     swap_data: Vec<u8>,
-) -> Result<()> {
+) -> Result<Measured> {
+    let SwapLimits { min_out, max_input, max_wallet_spend, deadline } = limits;
     require!(Clock::get()?.unix_timestamp <= deadline, RouterError::Expired);
     require!(min_out > 0, RouterError::ZeroMinOut);
 
-    let in_mint = ctx.accounts.input_account.mint;
-    let out_mint = ctx.accounts.output_account.mint;
+    let in_mint = input.mint;
+    let out_mint = output.mint;
     require_keys_neq!(in_mint, out_mint, RouterError::SameToken);
     require!(in_mint == WSOL_MINT || out_mint == WSOL_MINT, RouterError::UnpricedPair);
 
-    let swap_program = ctx.accounts.swap_program.key();
-    check_venue(&swap_program, &swap_data, ctx.remaining_accounts)?;
+    let swap_program = venue.key();
+    check_venue(&swap_program, &swap_data, remaining)?;
 
-    let user = ctx.accounts.user.key();
-    let input_key = ctx.accounts.input_account.key();
-    let output_key = ctx.accounts.output_account.key();
-    check_swap_accounts(ctx.remaining_accounts, &user, &input_key, &output_key)?;
+    let user = user_acc.key();
+    let input_key = input.key();
+    let output_key = output.key();
+    check_swap_accounts(remaining, &user, &input_key, &output_key)?;
 
-    let in_before = ctx.accounts.input_account.amount;
-    let wallet_before = ctx.accounts.user.lamports();
-    let out_before = ctx.accounts.output_account.amount;
-    let in_auth = authorities(&ctx.accounts.input_account);
-    let out_auth = authorities(&ctx.accounts.output_account);
-    let in_excess = excess_lamports(&ctx.accounts.input_account);
-    let out_excess = excess_lamports(&ctx.accounts.output_account);
+    let in_before = input.amount;
+    let wallet_before = user_acc.lamports();
+    let out_before = output.amount;
+    let in_auth = authorities(&input);
+    let out_auth = authorities(&output);
+    let in_excess = excess_lamports(&input);
+    let out_excess = excess_lamports(&output);
 
     // The swap. Only the user's signature is passed on (any other signer in the transaction is dropped), and the
-    // user's wallet is read-only unless the user signed a wallet spend (`execute_v2`): without one the swap can use
+    // user's wallet is read-only unless the user signed a wallet spend (`max_wallet_spend`): without one the swap can use
     // the user's signature, never move the wallet's SOL.
     let wallet_writable = max_wallet_spend > 0;
-    let metas: Vec<AccountMeta> = ctx
-        .remaining_accounts
+    let metas: Vec<AccountMeta> = remaining
         .iter()
         .map(|a| AccountMeta {
             pubkey: *a.key,
@@ -321,23 +552,23 @@ fn execute_swap<'info>(
             is_writable: a.is_writable && (*a.key != user || wallet_writable),
         })
         .collect();
-    let mut infos: Vec<AccountInfo<'info>> = ctx.remaining_accounts.to_vec();
-    infos.push(ctx.accounts.swap_program.to_account_info());
+    let mut infos: Vec<AccountInfo<'info>> = remaining.to_vec();
+    infos.push(venue.to_account_info());
     invoke(&Instruction { program_id: swap_program, accounts: metas, data: swap_data }, &infos)?;
 
-    ctx.accounts.input_account.reload()?;
-    ctx.accounts.output_account.reload()?;
+    input.reload()?;
+    output.reload()?;
     // The swap held the user's signature: it may move tokens, but must leave both accounts' owner, delegate and
     // close authority exactly as they were (no approval or authority change can outlive the transaction).
-    require!(authorities(&ctx.accounts.input_account) == in_auth, RouterError::AccountAuthorityChanged);
-    require!(authorities(&ctx.accounts.output_account) == out_auth, RouterError::AccountAuthorityChanged);
+    require!(authorities(&input) == in_auth, RouterError::AccountAuthorityChanged);
+    require!(authorities(&output) == out_auth, RouterError::AccountAuthorityChanged);
     // Neither measured account may lose SOL that is not its token amount (rent, surplus lamports, unsynced lamports
     // of a wSOL account): a swap could otherwise withdraw them, or sync them into the measured amount.
-    require!(excess_lamports(&ctx.accounts.input_account) >= in_excess, RouterError::AccountLamportsTaken);
-    require!(excess_lamports(&ctx.accounts.output_account) >= out_excess, RouterError::AccountLamportsTaken);
+    require!(excess_lamports(&input) >= in_excess, RouterError::AccountLamportsTaken);
+    require!(excess_lamports(&output) >= out_excess, RouterError::AccountLamportsTaken);
     // The wallet: still a plain system account (no Assign, no Allocate), and at most `max_wallet_spend` lamports
     // gone.
-    let wallet = ctx.accounts.user.to_account_info();
+    let wallet = user_acc.to_account_info();
     require!(wallet.owner == &NATIVE_PROGRAMS[0] && wallet.data_is_empty(), RouterError::WalletTampered);
     let wallet_after = wallet.lamports();
     require!(wallet_before.saturating_sub(wallet_after) <= max_wallet_spend, RouterError::WalletSpendTooHigh);
@@ -345,58 +576,18 @@ fn execute_swap<'info>(
     // can never hide behind a gain on the other. The token side is the measured account's own change.
     let wallet_change = wallet_after as i128 - wallet_before as i128;
     let (spent, received) = if in_mint == WSOL_MINT {
-        let sol_change = ctx.accounts.input_account.amount as i128 - in_before as i128 + wallet_change;
+        let sol_change = input.amount as i128 - in_before as i128 + wallet_change;
         let spent = u64::try_from((-sol_change).max(0)).map_err(|_| error!(RouterError::MathOverflow))?;
-        (spent, ctx.accounts.output_account.amount.saturating_sub(out_before))
+        (spent, output.amount.saturating_sub(out_before))
     } else {
-        let sol_change = ctx.accounts.output_account.amount as i128 - out_before as i128 + wallet_change;
+        let sol_change = output.amount as i128 - out_before as i128 + wallet_change;
         let received = u64::try_from(sol_change.max(0)).map_err(|_| error!(RouterError::MathOverflow))?;
-        (in_before.saturating_sub(ctx.accounts.input_account.amount), received)
+        (in_before.saturating_sub(input.amount), received)
     };
     require!(spent > 0, RouterError::ZeroInput);
     require!(spent <= max_input, RouterError::InputTooHigh);
     require!(received >= min_out, RouterError::InsufficientOutput);
-
-    // Exact fee on the wSOL side of what actually moved.
-    let total_bps = PROTOCOL_FEE_BPS + ctx.accounts.router.trader_fee_bps as u64;
-    let sol_side = core::cmp::max(
-        if in_mint == WSOL_MINT { spent } else { 0 },
-        if out_mint == WSOL_MINT { received } else { 0 },
-    );
-    let fee = core::cmp::max(ctx.accounts.config.min_fee, pct(sol_side, total_bps)?);
-    require!(fee <= max_fee, RouterError::FeeTooLow);
-
-    if fee > 0 {
-        invoke(
-            &system_instruction::transfer(&user, &ctx.accounts.vault.key(), fee),
-            &[
-                ctx.accounts.user.to_account_info(),
-                ctx.accounts.vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-    }
-    let protocol_fee = (fee as u128 * PROTOCOL_FEE_BPS as u128 / total_bps as u128) as u64;
-    let trader_fee = fee - protocol_fee;
-    let protocol_wallet = ctx.accounts.config.protocol_wallet;
-    let fee_wallet = ctx.accounts.router.fee_wallet;
-    add_credit(&ctx.accounts.protocol_credit, protocol_wallet, protocol_fee)?;
-    add_credit(&ctx.accounts.trader_credit, fee_wallet, trader_fee)?;
-    let config = &mut ctx.accounts.config;
-    config.total_credited = config.total_credited.checked_add(fee).ok_or(RouterError::MathOverflow)?;
-
-    emit!(Executed {
-        user,
-        router: ctx.accounts.router.key(),
-        input_mint: in_mint,
-        output_mint: out_mint,
-        spent,
-        received,
-        fee,
-        protocol_fee,
-        trader_fee,
-    });
-    Ok(())
+    Ok(Measured { in_mint, out_mint, spent, received })
 }
 
 /// A token account's lamports that are not its token amount: everything for a non-native account, the rent and any
@@ -482,6 +673,29 @@ fn check_wallet(wallet: &Pubkey, vault: &Pubkey) -> Result<()> {
 /// one of those two; anything else (a second wSOL account used as the real source while an empty one is measured)
 /// is refused. Works for both token programs without decoding the swap instruction.
 fn check_swap_accounts(accounts: &[AccountInfo], user: &Pubkey, input: &Pubkey, output: &Pubkey) -> Result<()> {
+    // Mints handed to the swap over which the user holds any power with its signature. Two cases:
+    //  - a WRITABLE mint naming the user anywhere (mint or freeze authority, or any Token-2022 extension authority:
+    //    mint close, transfer fee, transfer hook, pausable, interest rate, metadata, group, ...) is refused outright,
+    //    since every mint-level action needs the mint writable;
+    //  - a mint, even read-only, through which the user can act on OTHER people's accounts (freeze authority,
+    //    permanent delegate, transfer-fee withdraw-withheld authority, confidential-transfer approval authority):
+    //    no writable account of that mint may reach the swap, except the measured input and output.
+    let mut user_mints: Vec<Pubkey> = Vec::new();
+    for a in accounts {
+        if a.owner != &anchor_spl::token::ID && a.owner != &anchor_spl::token_2022::ID {
+            continue;
+        }
+        let data = a.try_borrow_data()?;
+        if !is_mint(&data) {
+            continue;
+        }
+        if a.is_writable && mint_names_user(&data, user) {
+            return err!(RouterError::AuthorityExposed);
+        }
+        if mint_gives_account_power(&data, user) {
+            user_mints.push(*a.key);
+        }
+    }
     for a in accounts {
         // Native-program accounts can name the user as their authority (stake, vote, program upgrade, lookup table,
         // durable nonce), and the swap holds the user's signature: none may be writable in the swap. The user's wallet
@@ -507,14 +721,86 @@ fn check_swap_accounts(accounts: &[AccountInfo], user: &Pubkey, input: &Pubkey, 
         if !is_token_account(&data) {
             continue;
         }
+        // Any other writable token account the user can act on with its signature: as owner, delegate, or close
+        // authority (closing it sends its lamports, a wSOL account's whole balance, wherever the venue chooses).
         let owner = &data[32..64];
-        let has_delegate = u32::from_le_bytes([data[72], data[73], data[74], data[75]]) == 1;
-        let delegate = &data[76..108];
-        if owner == user.as_ref() || (has_delegate && delegate == user.as_ref()) {
+        let delegate = coption_key(&data, 72);
+        let close_authority = coption_key(&data, 129);
+        if owner == user.as_ref() || delegate == Some(*user) || close_authority == Some(*user) {
             return err!(RouterError::SwapAccountNotBound);
+        }
+        // ...or of a mint through which the user can act on other people's accounts.
+        let mint = key_at(&data, 0);
+        if user_mints.contains(&mint) {
+            return err!(RouterError::AuthorityExposed);
         }
     }
     Ok(())
+}
+
+/// The key of a `COption<Pubkey>` at `at` (u32 tag, then 32 bytes), if set.
+fn coption_key(data: &[u8], at: usize) -> Option<Pubkey> {
+    if data.len() < at + 36 || u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) != 1 {
+        return None;
+    }
+    Some(key_at(data, at + 4))
+}
+fn key_at(data: &[u8], at: usize) -> Pubkey {
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&data[at..at + 32]);
+    Pubkey::new_from_array(k)
+}
+
+/// A mint in either token program: 82 bytes (SPL Token), or longer with the Token-2022 account-type byte at 165 = 1.
+fn is_mint(data: &[u8]) -> bool {
+    data.len() == 82 || (data.len() > 165 && data.len() != MULTISIG_LEN && data[165] == 1)
+}
+
+/// The key at `offset` inside a Token-2022 mint's extension of type `ext` (TLV entries after the account-type byte),
+/// if the mint has that extension and the key is set.
+fn extension_key(data: &[u8], ext: u16, offset: usize) -> Option<Pubkey> {
+    if data.len() <= 166 {
+        return None;
+    }
+    let mut i = 166;
+    while i + 4 <= data.len() {
+        let ty = u16::from_le_bytes([data[i], data[i + 1]]);
+        let len = u16::from_le_bytes([data[i + 2], data[i + 3]]) as usize;
+        let start = i + 4;
+        if ty == 0 || start + len > data.len() {
+            return None; // end of the extensions (or malformed)
+        }
+        if ty == ext && offset + 32 <= len {
+            let k = key_at(data, start + offset);
+            return if k == Pubkey::default() { None } else { Some(k) };
+        }
+        i = start + len;
+    }
+    None
+}
+
+/// The user is the mint's mint or freeze authority, or its key appears anywhere in the Token-2022 extensions (every
+/// extension authority, including ones added to the token program later).
+fn mint_names_user(data: &[u8], user: &Pubkey) -> bool {
+    if coption_key(data, 0) == Some(*user) || coption_key(data, 46) == Some(*user) {
+        return true;
+    }
+    data.len() > 166 && data[166..].windows(32).any(|w| w == user.as_ref())
+}
+
+/// Token-2022 extension types whose authority acts on token accounts of the mint while the mint is read-only.
+const EXT_TRANSFER_FEE_CONFIG: u16 = 1; // withdraw_withheld_authority at offset 32
+const EXT_CONFIDENTIAL_TRANSFER_MINT: u16 = 4; // authority at offset 0 (approves accounts)
+const EXT_PERMANENT_DELEGATE: u16 = 12; // delegate at offset 0
+
+/// Through this mint the user can act on accounts it does not own: freeze authority, permanent delegate,
+/// transfer-fee withdraw-withheld authority, or confidential-transfer approval authority.
+fn mint_gives_account_power(data: &[u8], user: &Pubkey) -> bool {
+    let me = Some(*user);
+    coption_key(data, 46) == me
+        || extension_key(data, EXT_PERMANENT_DELEGATE, 0) == me
+        || extension_key(data, EXT_TRANSFER_FEE_CONFIG, 32) == me
+        || extension_key(data, EXT_CONFIDENTIAL_TRANSFER_MINT, 0) == me
 }
 
 /// A token account in either token program: 165 bytes (SPL Token), or longer with the Token-2022 account-type byte
@@ -529,13 +815,14 @@ const MULTISIG_LEN: usize = 355;
 
 /// Makes sure `wallet`'s credit account exists, creating it (paid by `payer`) if not. Works even if someone
 /// pre-funded the address with lamports. Called only when a wallet is set, never during a swap.
-fn ensure_credit<'info>(
+fn ensure_credit_in<'info>(
+    seed: &[u8],
     credit: &UncheckedAccount<'info>,
     wallet: Pubkey,
     payer: &Signer<'info>,
     system_program: &Program<'info, System>,
 ) -> Result<()> {
-    let (expected, bump) = Pubkey::find_program_address(&[CREDIT_SEED, wallet.as_ref()], &crate::ID);
+    let (expected, bump) = Pubkey::find_program_address(&[seed, wallet.as_ref()], &crate::ID);
     require_keys_eq!(credit.key(), expected, RouterError::WrongCreditAccount);
     let info = credit.to_account_info();
     if info.owner == &crate::ID {
@@ -543,7 +830,7 @@ fn ensure_credit<'info>(
         require_keys_eq!(c.wallet, wallet, RouterError::WrongCreditAccount);
         return Ok(());
     }
-    let seeds: &[&[u8]] = &[CREDIT_SEED, wallet.as_ref(), &[bump]];
+    let seeds: &[&[u8]] = &[seed, wallet.as_ref(), &[bump]];
     let space = 8 + Credit::INIT_SPACE;
     let need = Rent::get()?.minimum_balance(space).saturating_sub(info.lamports());
     if need > 0 {
@@ -571,8 +858,8 @@ fn ensure_credit<'info>(
 
 /// Adds `amount` to `wallet`'s existing credit account. Read-modify-write on the account's own bytes, so the
 /// protocol wallet and a router's fee wallet may be the same address: the second credit reads what the first wrote.
-fn add_credit(credit: &UncheckedAccount, wallet: Pubkey, amount: u64) -> Result<()> {
-    let (expected, _) = Pubkey::find_program_address(&[CREDIT_SEED, wallet.as_ref()], &crate::ID);
+fn add_credit_in(seed: &[u8], credit: &UncheckedAccount, wallet: Pubkey, amount: u64) -> Result<()> {
+    let (expected, _) = Pubkey::find_program_address(&[seed, wallet.as_ref()], &crate::ID);
     require_keys_eq!(credit.key(), expected, RouterError::WrongCreditAccount);
     if amount == 0 {
         return Ok(());
@@ -592,34 +879,6 @@ fn add_credit(credit: &UncheckedAccount, wallet: Pubkey, amount: u64) -> Result<
 
 #[account]
 #[derive(InitSpace)]
-pub struct Config {
-    pub owner: Pubkey,
-    pub pending_owner: Pubkey,
-    pub protocol_wallet: Pubkey,
-    /// Fee floor, lamports. At most `max_min_fee`.
-    pub min_fee: u64,
-    /// Cap on the floor, lamports. Set once at initialize; no setter.
-    pub max_min_fee: u64,
-    /// Sum of all credits; the vault always holds exactly this above its rent reserve.
-    pub total_credited: u64,
-    pub bump: u8,
-    pub vault_bump: u8,
-}
-
-#[account]
-#[derive(InitSpace)]
-pub struct Router {
-    pub owner: Pubkey,
-    pub pending_owner: Pubkey,
-    pub fee_wallet: Pubkey,
-    /// Fixed at creation; no setter.
-    pub trader_fee_bps: u16,
-    pub salt: [u8; 32],
-    pub bump: u8,
-}
-
-#[account]
-#[derive(InitSpace)]
 pub struct Credit {
     pub wallet: Pubkey,
     /// Lamports `wallet` can collect.
@@ -627,18 +886,78 @@ pub struct Credit {
     pub bump: u8,
 }
 
-// ============================================================================ instruction contexts
+// ============================================================================ accounts and instruction contexts
+
+#[account]
+#[derive(InitSpace)]
+pub struct ConfigV4 {
+    pub owner: Pubkey,
+    pub pending_owner: Pubkey,
+    pub protocol_wallet: Pubkey,
+    /// Fee floor, lamports. At most `max_min_fee`.
+    pub min_fee: u64,
+    /// Cap on the floor, lamports. Set once at `initialize_v4`; no setter.
+    pub max_min_fee: u64,
+    /// Fee rate, basis points of the SOL side; at most `MAX_FEE_BPS_V4`.
+    pub fee_bps: u16,
+    /// Payee share, basis points of the fee; at most `MAX_PAYEE_SHARE_BPS`.
+    pub payee_share_bps: u16,
+    /// The community's part of the payee share when a trade names both payees, basis points of the share.
+    pub community_split_bps: u16,
+    /// Sum of all V4 credits (protocol + payees); the V4 vault always holds exactly this above its rent reserve.
+    pub total_credited: u64,
+    pub bump: u8,
+    pub vault_bump: u8,
+}
+
+/// A community (kind 1) or referral (kind 2), at PDA ["payee", id], id = the EVM `payeeId`.
+#[account]
+#[derive(InitSpace)]
+pub struct Payee {
+    pub kind: u8,
+    /// The EVM address that signs its registrations.
+    pub owner: [u8; 20],
+    pub name: [u8; 32],
+    /// Payout wallet on Solana.
+    pub wallet: Pubkey,
+    pub version: u64,
+    /// Lamports it can collect.
+    pub amount: u64,
+    pub bump: u8,
+}
+
+/// The signed message (same fields and signature as on EVM) plus the signature itself.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct Registration {
+    pub kind: u8,
+    pub owner: [u8; 20],
+    pub name: [u8; 32],
+    /// The EVM payout wallet: part of the signed message (unused on Solana).
+    pub evm_wallet: [u8; 20],
+    /// The Solana payout wallet; must not be empty here.
+    pub solana_wallet: Pubkey,
+    pub version: u64,
+    /// r (32) | s (32) | v (1), v = 27 or 28.
+    pub signature: [u8; 65],
+}
+
+/// A payee a trade names: its ID and the payout wallet the app expects it to have.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct Party {
+    pub id: [u8; 32],
+    pub wallet: Pubkey,
+}
 
 #[derive(Accounts)]
-pub struct Initialize<'info> {
+pub struct InitializeV4<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    #[account(init, payer = payer, space = 8 + Config::INIT_SPACE, seeds = [CONFIG_SEED], bump)]
-    pub config: Account<'info, Config>,
+    #[account(init, payer = payer, space = 8 + ConfigV4::INIT_SPACE, seeds = [CONFIG_V4_SEED], bump)]
+    pub config: Account<'info, ConfigV4>,
     /// CHECK: lamport-only PDA (system-owned, no data); its address is fixed by the seeds.
-    #[account(mut, seeds = [VAULT_SEED], bump)]
+    #[account(mut, seeds = [VAULT_V4_SEED], bump)]
     pub vault: UncheckedAccount<'info>,
-    /// CHECK: the protocol wallet's credit PDA; address checked and account created in `ensure_credit`.
+    /// CHECK: the protocol wallet's V4 credit PDA; address checked and account created in `ensure_credit_in`.
     #[account(mut)]
     pub protocol_credit: UncheckedAccount<'info>,
     #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ RouterError::NotUpgradeAuthority)]
@@ -649,96 +968,65 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(fee_wallet: Pubkey, trader_fee_bps: u16, salt: [u8; 32])]
-pub struct CreateRouter<'info> {
+pub struct ConfigV4OwnerOnly<'info> {
+    pub owner: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_V4_SEED], bump = config.bump, has_one = owner @ RouterError::NotOwner)]
+    pub config: Account<'info, ConfigV4>,
+}
+
+#[derive(Accounts)]
+pub struct SetProtocolWalletV4<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
-    #[account(init, payer = owner, space = 8 + Router::INIT_SPACE, seeds = [ROUTER_SEED, owner.key().as_ref(), salt.as_ref()], bump)]
-    pub router: Account<'info, Router>,
-    /// CHECK: only its address is compared (a wallet may never be the vault).
-    #[account(seeds = [VAULT_SEED], bump)]
+    #[account(mut, seeds = [CONFIG_V4_SEED], bump = config.bump, has_one = owner @ RouterError::NotOwner)]
+    pub config: Account<'info, ConfigV4>,
+    /// CHECK: lamport-only PDA; only its address is used.
+    #[account(seeds = [VAULT_V4_SEED], bump = config.vault_bump)]
     pub vault: UncheckedAccount<'info>,
-    /// CHECK: the fee wallet's credit PDA; address checked and account created in `ensure_credit`.
+    /// CHECK: the new wallet's V4 credit PDA; address checked and account created in `ensure_credit_in`.
     #[account(mut)]
-    pub fee_credit: UncheckedAccount<'info>,
+    pub wallet_credit: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct RouterOwnerOnly<'info> {
-    pub owner: Signer<'info>,
-    #[account(mut, has_one = owner @ RouterError::NotOwner)]
-    pub router: Account<'info, Router>,
-}
-
-#[derive(Accounts)]
-pub struct SetFeeWallet<'info> {
-    #[account(mut)]
-    pub owner: Signer<'info>,
-    #[account(mut, has_one = owner @ RouterError::NotOwner)]
-    pub router: Account<'info, Router>,
-    /// CHECK: only its address is compared (a wallet may never be the vault).
-    #[account(seeds = [VAULT_SEED], bump)]
-    pub vault: UncheckedAccount<'info>,
-    /// CHECK: the new wallet's credit PDA; address checked and account created in `ensure_credit`.
-    #[account(mut)]
-    pub credit: UncheckedAccount<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct AcceptRouterOwnership<'info> {
+pub struct AcceptOwnershipV4<'info> {
     pub new_owner: Signer<'info>,
-    #[account(mut, constraint = router.pending_owner == new_owner.key() @ RouterError::NotPendingOwner)]
-    pub router: Account<'info, Router>,
+    #[account(mut, seeds = [CONFIG_V4_SEED], bump = config.bump, constraint = config.pending_owner == new_owner.key() @ RouterError::NotPendingOwner)]
+    pub config: Account<'info, ConfigV4>,
 }
 
 #[derive(Accounts)]
-pub struct ConfigOwnerOnly<'info> {
-    pub owner: Signer<'info>,
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = owner @ RouterError::NotOwner)]
-    pub config: Account<'info, Config>,
-}
-
-#[derive(Accounts)]
-pub struct SetProtocolWallet<'info> {
+pub struct RegisterPayee<'info> {
     #[account(mut)]
-    pub owner: Signer<'info>,
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = owner @ RouterError::NotOwner)]
-    pub config: Account<'info, Config>,
-    /// CHECK: only its address is compared (a wallet may never be the vault).
-    #[account(seeds = [VAULT_SEED], bump = config.vault_bump)]
+    pub payer: Signer<'info>,
+    /// CHECK: the payee PDA ["payee", id]; address checked and account created or updated in `register_payee`.
+    #[account(mut)]
+    pub payee: UncheckedAccount<'info>,
+    /// CHECK: the V4 vault (only its address is used: it can never be a payout wallet).
+    #[account(seeds = [VAULT_V4_SEED], bump)]
     pub vault: UncheckedAccount<'info>,
-    /// CHECK: the new wallet's credit PDA; address checked and account created in `ensure_credit`.
-    #[account(mut)]
-    pub credit: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct AcceptConfigOwnership<'info> {
-    pub new_owner: Signer<'info>,
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, constraint = config.pending_owner == new_owner.key() @ RouterError::NotPendingOwner)]
-    pub config: Account<'info, Config>,
-}
-
-#[derive(Accounts)]
-pub struct Execute<'info> {
+pub struct ExecuteV4<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    pub router: Box<Account<'info, Router>>,
+    #[account(mut, seeds = [CONFIG_V4_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, ConfigV4>>,
     /// CHECK: lamport-only PDA, address fixed by the seeds.
-    #[account(mut, seeds = [VAULT_SEED], bump = config.vault_bump)]
+    #[account(mut, seeds = [VAULT_V4_SEED], bump = config.vault_bump)]
     pub vault: UncheckedAccount<'info>,
-    /// CHECK: the protocol wallet's credit PDA (created when the wallet was set); checked in `add_credit`.
+    /// CHECK: the protocol wallet's V4 credit PDA; checked in `add_credit_in`.
     #[account(mut)]
     pub protocol_credit: UncheckedAccount<'info>,
-    /// CHECK: the router fee wallet's credit PDA (created when the wallet was set); checked in `add_credit`; may
-    /// equal `protocol_credit`.
+    /// CHECK: the named community's payee PDA, checked in `resolve_payee` (none: no community).
     #[account(mut)]
-    pub trader_credit: UncheckedAccount<'info>,
+    pub community_payee: Option<UncheckedAccount<'info>>,
+    /// CHECK: the named referral's payee PDA, checked in `resolve_payee` (none: no referral).
+    #[account(mut)]
+    pub referral_payee: Option<UncheckedAccount<'info>>,
     /// The user's token account the swap pays from.
     #[account(mut, constraint = input_account.owner == user.key() @ RouterError::NotUsersAccount)]
     pub input_account: Box<InterfaceAccount<'info, TokenAccount>>,
@@ -752,13 +1040,28 @@ pub struct Execute<'info> {
 }
 
 #[derive(Accounts)]
-pub struct Collect<'info> {
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, Config>,
+pub struct CollectPayee<'info> {
+    #[account(mut, seeds = [CONFIG_V4_SEED], bump = config.bump)]
+    pub config: Account<'info, ConfigV4>,
     /// CHECK: lamport-only PDA, address fixed by the seeds.
-    #[account(mut, seeds = [VAULT_SEED], bump = config.vault_bump)]
+    #[account(mut, seeds = [VAULT_V4_SEED], bump = config.vault_bump)]
     pub vault: UncheckedAccount<'info>,
-    #[account(mut, seeds = [CREDIT_SEED, wallet.key().as_ref()], bump = credit.bump, constraint = credit.wallet == wallet.key() @ RouterError::WrongCreditAccount)]
+    #[account(mut, seeds = [PAYEE_SEED, &payee_id(payee.kind, &payee.owner, &payee.name)], bump = payee.bump, constraint = payee.wallet == wallet.key() @ RouterError::WrongCreditAccount)]
+    pub payee: Account<'info, Payee>,
+    /// CHECK: receives the lamports; must be the payee's current wallet (checked on `payee`).
+    #[account(mut)]
+    pub wallet: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CollectV4<'info> {
+    #[account(mut, seeds = [CONFIG_V4_SEED], bump = config.bump)]
+    pub config: Account<'info, ConfigV4>,
+    /// CHECK: lamport-only PDA, address fixed by the seeds.
+    #[account(mut, seeds = [VAULT_V4_SEED], bump = config.vault_bump)]
+    pub vault: UncheckedAccount<'info>,
+    #[account(mut, seeds = [CREDIT_V4_SEED, wallet.key().as_ref()], bump = credit.bump, constraint = credit.wallet == wallet.key() @ RouterError::WrongCreditAccount)]
     pub credit: Account<'info, Credit>,
     /// CHECK: receives the lamports; must be the credit's wallet (checked on `credit`).
     #[account(mut)]
@@ -768,50 +1071,45 @@ pub struct Collect<'info> {
 
 // ============================================================================ events
 
+/// One per V4 swap: who traded, which community and referral it named, where their shares were credited, and the
+/// split. An ID is zero when the trade named none; a wallet is the default key (and its fee 0) when that payee earned
+/// nothing. fee = protocol_fee + community_fee + referral_fee.
 #[event]
-pub struct Initialized {
-    pub owner: Pubkey,
-    pub protocol_wallet: Pubkey,
-    pub min_fee: u64,
-    pub max_min_fee: u64,
-}
-
-#[event]
-pub struct RouterCreated {
-    pub router: Pubkey,
-    pub owner: Pubkey,
-    pub fee_wallet: Pubkey,
-    pub trader_fee_bps: u16,
-    pub salt: [u8; 32],
-}
-
-#[event]
-pub struct FeeWalletSet {
-    pub router: Pubkey,
-    pub wallet: Pubkey,
-}
-
-#[event]
-pub struct MinFeeSet {
-    pub lamports: u64,
-}
-
-#[event]
-pub struct ProtocolWalletSet {
-    pub wallet: Pubkey,
-}
-
-#[event]
-pub struct Executed {
+pub struct FeePaid {
     pub user: Pubkey,
-    pub router: Pubkey,
+    pub community_id: [u8; 32],
+    pub referral_id: [u8; 32],
+    pub community_wallet: Pubkey,
+    pub referral_wallet: Pubkey,
+    pub fee: u64,
+    pub protocol_fee: u64,
+    pub community_fee: u64,
+    pub referral_fee: u64,
     pub input_mint: Pubkey,
     pub output_mint: Pubkey,
     pub spent: u64,
     pub received: u64,
-    pub fee: u64,
-    pub protocol_fee: u64,
-    pub trader_fee: u64,
+}
+
+#[event]
+pub struct PayeeRegistered {
+    pub id: [u8; 32],
+    pub kind: u8,
+    pub owner: [u8; 20],
+    pub name: [u8; 32],
+    pub wallet: Pubkey,
+    pub version: u64,
+}
+
+/// The V4 settings after any change (and at initialize).
+#[event]
+pub struct V4Settings {
+    pub owner: Pubkey,
+    pub protocol_wallet: Pubkey,
+    pub min_fee: u64,
+    pub fee_bps: u16,
+    pub payee_share_bps: u16,
+    pub community_split_bps: u16,
 }
 
 #[event]
@@ -878,4 +1176,12 @@ pub enum RouterError {
     WalletSpendTooHigh,
     #[msg("The swap took lamports from the measured input or output account beyond its token amount")]
     AccountLamportsTaken,
+    #[msg("The payee is not registered as that kind, or its stored wallet is not the one the trade expects")]
+    PayeeMismatch,
+    #[msg("Registration fields are invalid")]
+    BadRegistration,
+    #[msg("The registration signature is not the owner's")]
+    BadSignature,
+    #[msg("The swap was handed a writable mint naming the user as an authority, or another account of a mint through which the user can act on accounts it does not own")]
+    AuthorityExposed,
 }

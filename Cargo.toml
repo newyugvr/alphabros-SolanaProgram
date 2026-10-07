@@ -8,6 +8,8 @@ solana = "4.3.0"
 
 [profile.release]
 overflow-checks = true
+# Smallest code: the program must fit the program-data space already paid for on mainnet (349,680 bytes).
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 

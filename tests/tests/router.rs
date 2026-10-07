@@ -1,4 +1,6 @@
-//! Alphabros router (Solana) — LiteSVM tests against the real compiled programs (target/deploy/*.so).
+//! Alphabros router (Solana, V4) — swap safety, fees and collection: LiteSVM tests against the real compiled programs
+//! (target/deploy/*.so). Every swap here is `execute_v4` with no community or referral named, at a 0.40% fee rate, so
+//! the whole fee is the protocol's; the payee share is tested in v4.rs.
 //!
 //!   cargo-build-sbf (both programs)  then  cargo test -p alphabros-tests
 //!
@@ -6,7 +8,7 @@
 //! from its pool, so each test sets exact amounts. wSOL (So111…112) is the priced side. Venues are permissionless:
 //! the router has never been told about `mock_swap`. Its `relay` instruction is a hostile venue that does whatever a
 //! test asks with the user's signature.
-use alphabros_router::{self as router, Config, Credit, Router, RouterError};
+use alphabros_router::{self as router, ConfigV4, Credit, RouterError};
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use litesvm::LiteSVM;
 use solana_account::Account;
@@ -25,7 +27,7 @@ const MOCK_SO: &str = "../target/deploy/mock_swap.so";
 const SOL: u64 = 1_000_000_000;
 const MIN_FEE: u64 = 2_500_000; // 0.0025 SOL
 const MAX_MIN_FEE: u64 = 50_000_000; // 0.05 SOL
-const TRADER_BPS: u16 = 15; // total 0.40%
+const FEE_BPS: u16 = 40; // 0.40%
 
 fn wsol() -> Pubkey {
     router::WSOL_MINT
@@ -37,16 +39,13 @@ fn pda(seeds: &[&[u8]], program: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(seeds, program).0
 }
 fn config_pda() -> Pubkey {
-    pda(&[router::CONFIG_SEED], &router::ID)
+    pda(&[router::CONFIG_V4_SEED], &router::ID)
 }
 fn vault_pda() -> Pubkey {
-    pda(&[router::VAULT_SEED], &router::ID)
+    pda(&[router::VAULT_V4_SEED], &router::ID)
 }
 fn credit_pda(wallet: &Pubkey) -> Pubkey {
-    pda(&[router::CREDIT_SEED, wallet.as_ref()], &router::ID)
-}
-fn router_pda(owner: &Pubkey, salt: &[u8; 32]) -> Pubkey {
-    pda(&[router::ROUTER_SEED, owner.as_ref(), salt], &router::ID)
+    pda(&[router::CREDIT_V4_SEED, wallet.as_ref()], &router::ID)
 }
 fn pool_authority() -> Pubkey {
     pda(&[mock_swap::POOL_SEED], &mock_swap::ID)
@@ -67,11 +66,8 @@ struct Env {
     svm: LiteSVM,
     admin: Keypair,
     protocol_wallet: Pubkey,
-    trader: Keypair,
-    trader_wallet: Pubkey,
     user: Keypair,
     meme: Pubkey,
-    router: Pubkey,
     pool_wsol: Pubkey,
     pool_meme: Pubkey,
     user_wsol: Pubkey,
@@ -90,17 +86,14 @@ impl Env {
             svm,
             admin,
             protocol_wallet: Pubkey::new_unique(),
-            trader: Keypair::new(),
-            trader_wallet: Pubkey::new_unique(),
             user: Keypair::new(),
             meme: Pubkey::new_unique(),
-            router: Pubkey::default(),
             pool_wsol: Pubkey::new_unique(),
             pool_meme: Pubkey::new_unique(),
             user_wsol: Pubkey::new_unique(),
             user_meme: Pubkey::new_unique(),
         };
-        for kp in [&env.admin, &env.trader, &env.user] {
+        for kp in [&env.admin, &env.user] {
             env.svm.airdrop(&kp.pubkey(), 1_000 * SOL).unwrap();
         }
         env.mint(wsol(), 9);
@@ -114,7 +107,6 @@ impl Env {
         env.token_account(env.user_meme, meme, user, 0);
 
         env.initialize(MIN_FEE, MAX_MIN_FEE).unwrap();
-        env.router = env.create_router(&env.trader.insecure_clone(), env.trader_wallet, TRADER_BPS, [1; 32]).unwrap();
         env
     }
 
@@ -170,11 +162,8 @@ impl Env {
     fn lamports(&self, a: &Pubkey) -> u64 {
         self.svm.get_account(a).map(|x| x.lamports).unwrap_or(0)
     }
-    fn config(&self) -> Config {
-        Config::try_deserialize(&mut &self.svm.get_account(&config_pda()).unwrap().data[..]).unwrap()
-    }
-    fn router_state(&self, r: &Pubkey) -> Router {
-        Router::try_deserialize(&mut &self.svm.get_account(r).unwrap().data[..]).unwrap()
+    fn config(&self) -> ConfigV4 {
+        ConfigV4::try_deserialize(&mut &self.svm.get_account(&config_pda()).unwrap().data[..]).unwrap()
     }
     fn credit(&self, wallet: &Pubkey) -> u64 {
         match self.svm.get_account(&credit_pda(wallet)) {
@@ -203,7 +192,7 @@ impl Env {
     fn initialize_as(&mut self, payer: &Keypair, min_fee: u64, max_min_fee: u64) -> Result<(), TransactionError> {
         let ix = Instruction {
             program_id: router::ID,
-            accounts: router::accounts::Initialize {
+            accounts: router::accounts::InitializeV4 {
                 payer: payer.pubkey(),
                 config: config_pda(),
                 vault: vault_pda(),
@@ -213,32 +202,18 @@ impl Env {
                 system_program: solana_system_interface::program::ID,
             }
             .to_account_metas(None),
-            data: router::instruction::Initialize {
+            data: router::instruction::InitializeV4 {
                 owner: self.admin.pubkey(),
                 protocol_wallet: self.protocol_wallet,
                 min_fee,
                 max_min_fee,
+                fee_bps: FEE_BPS,
+                payee_share_bps: 6_000,
+                community_split_bps: 5_000,
             }
             .data(),
         };
         self.send(&[ix], payer, &[])
-    }
-
-    fn create_router(&mut self, owner: &Keypair, fee_wallet: Pubkey, bps: u16, salt: [u8; 32]) -> Result<Pubkey, TransactionError> {
-        let r = router_pda(&owner.pubkey(), &salt);
-        let ix = Instruction {
-            program_id: router::ID,
-            accounts: router::accounts::CreateRouter {
-                owner: owner.pubkey(),
-                router: r,
-                vault: vault_pda(),
-                fee_credit: credit_pda(&fee_wallet),
-                system_program: solana_system_interface::program::ID,
-            }
-            .to_account_metas(None),
-            data: router::instruction::CreateRouter { fee_wallet, trader_fee_bps: bps, salt }.data(),
-        };
-        self.send(&[ix], owner, &[]).map(|_| r)
     }
 
     /// The mock venue's swap instruction: `amount_in` of `user_in` from `user`, `amount_out` into `user_out`.
@@ -263,22 +238,26 @@ impl Env {
         }
     }
 
-    /// `execute` wrapping `venue`: the venue's accounts become `remaining_accounts`.
-    fn execute_ix(&self, user: &Pubkey, router_key: Pubkey, input: Pubkey, output: Pubkey, venue: Instruction, min_out: u64, max_fee: u64, deadline: i64) -> Instruction {
-        self.execute_ix_full(user, router_key, input, output, venue, min_out, max_fee, u64::MAX, deadline)
+    /// `execute_v4` wrapping `venue` (no payees, wallet read-only): the venue's accounts become `remaining_accounts`.
+    fn execute_ix(&self, user: &Pubkey, input: Pubkey, output: Pubkey, venue: Instruction, min_out: u64, max_fee: u64, deadline: i64) -> Instruction {
+        self.execute_ix_full(user, input, output, venue, min_out, max_fee, u64::MAX, deadline)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_ix_full(&self, user: &Pubkey, router_key: Pubkey, input: Pubkey, output: Pubkey, venue: Instruction, min_out: u64, max_fee: u64, max_input: u64, deadline: i64) -> Instruction {
+    fn execute_ix_full(&self, user: &Pubkey, input: Pubkey, output: Pubkey, venue: Instruction, min_out: u64, max_fee: u64, max_input: u64, deadline: i64) -> Instruction {
+        self.execute_ix_spend(user, input, output, venue, min_out, max_fee, max_input, 0, deadline)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_ix_spend(&self, user: &Pubkey, input: Pubkey, output: Pubkey, venue: Instruction, min_out: u64, max_fee: u64, max_input: u64, max_wallet_spend: u64, deadline: i64) -> Instruction {
         let cfg = self.config();
-        let fee_wallet = self.router_state(&router_key).fee_wallet;
-        let mut accounts = router::accounts::Execute {
+        let mut accounts = router::accounts::ExecuteV4 {
             user: *user,
             config: config_pda(),
-            router: router_key,
             vault: vault_pda(),
             protocol_credit: credit_pda(&cfg.protocol_wallet),
-            trader_credit: credit_pda(&fee_wallet),
+            community_payee: None,
+            referral_payee: None,
             input_account: input,
             output_account: output,
             swap_program: venue.program_id,
@@ -289,7 +268,7 @@ impl Env {
         Instruction {
             program_id: router::ID,
             accounts,
-            data: router::instruction::Execute { min_out, max_fee, max_input, deadline, swap_data: venue.data }.data(),
+            data: router::instruction::ExecuteV4 { min_out, max_fee, max_input, max_wallet_spend, deadline, swap_data: venue.data, community: None, referral: None }.data(),
         }
     }
 
@@ -297,7 +276,7 @@ impl Env {
     fn buy(&mut self, sol_in: u64, meme_out: u64, min_out: u64, max_fee: u64) -> Result<(), TransactionError> {
         let u = self.user.pubkey();
         let venue = self.venue_ix(&u, self.user_wsol, self.user_meme, wsol(), self.meme, sol_in, meme_out);
-        let ix = self.execute_ix_full(&u, self.router, self.user_wsol, self.user_meme, venue, min_out, max_fee, sol_in, i64::MAX);
+        let ix = self.execute_ix_full(&u, self.user_wsol, self.user_meme, venue, min_out, max_fee, sol_in, i64::MAX);
         let user = self.user.insecure_clone();
         self.send(&[ix], &user, &[])
     }
@@ -306,7 +285,7 @@ impl Env {
     fn sell(&mut self, meme_in: u64, sol_out: u64, min_out: u64, max_fee: u64) -> Result<(), TransactionError> {
         let u = self.user.pubkey();
         let venue = self.venue_ix(&u, self.user_meme, self.user_wsol, self.meme, wsol(), meme_in, sol_out);
-        let ix = self.execute_ix_full(&u, self.router, self.user_meme, self.user_wsol, venue, min_out, max_fee, meme_in, i64::MAX);
+        let ix = self.execute_ix_full(&u, self.user_meme, self.user_wsol, venue, min_out, max_fee, meme_in, i64::MAX);
         let user = self.user.insecure_clone();
         self.send(&[ix], &user, &[])
     }
@@ -314,7 +293,7 @@ impl Env {
     fn collect(&mut self, wallet: Pubkey, caller: &Keypair) -> Result<(), TransactionError> {
         let ix = Instruction {
             program_id: router::ID,
-            accounts: router::accounts::Collect {
+            accounts: router::accounts::CollectV4 {
                 config: config_pda(),
                 vault: vault_pda(),
                 credit: credit_pda(&wallet),
@@ -322,7 +301,7 @@ impl Env {
                 system_program: solana_system_interface::program::ID,
             }
             .to_account_metas(None),
-            data: router::instruction::Collect {}.data(),
+            data: router::instruction::CollectV4 {}.data(),
         };
         self.send(&[ix], caller, &[])
     }
@@ -330,7 +309,7 @@ impl Env {
     fn assert_solvent(&self) {
         let cfg = self.config();
         assert_eq!(self.lamports(&vault_pda()) - self.vault_rent(), cfg.total_credited, "vault holds exactly the credits");
-        assert_eq!(self.credit(&self.protocol_wallet) + self.credit(&self.trader_wallet), cfg.total_credited, "credits add up");
+        assert_eq!(self.credit(&self.protocol_wallet), cfg.total_credited, "credits add up (no payees named)");
     }
 }
 
@@ -376,135 +355,45 @@ fn initialize_only_by_upgrade_authority_and_once() {
 }
 
 #[test]
-fn initialize_refuses_strangers_and_bad_settings() {
-    let mut svm = LiteSVM::new();
-    svm.add_program_from_file(router::ID, ROUTER_SO).unwrap();
-    let admin = Keypair::new();
-    set_upgrade_authority(&mut svm, &router::ID, Some(admin.pubkey()));
-    let mut env = Env { svm, ..Env::bare(admin) };
-    let stranger = Keypair::new();
-    env.svm.airdrop(&stranger.pubkey(), SOL).unwrap();
-    let admin_key = env.admin.pubkey();
-    env.svm.airdrop(&admin_key, SOL).unwrap();
-    let e = env.initialize_as(&stranger, MIN_FEE, MAX_MIN_FEE).unwrap_err();
-    assert_eq!(custom_code(&e), Some(code(RouterError::NotUpgradeAuthority)));
-    let e = env.initialize(MAX_MIN_FEE + 1, MAX_MIN_FEE).unwrap_err();
-    assert_eq!(custom_code(&e), Some(code(RouterError::AboveCap)));
-}
-
-impl Env {
-    /// An environment with only the admin set (for initialize tests).
-    fn bare(admin: Keypair) -> Self {
-        Env {
-            svm: LiteSVM::new(),
-            admin,
-            protocol_wallet: Pubkey::new_unique(),
-            trader: Keypair::new(),
-            trader_wallet: Pubkey::new_unique(),
-            user: Keypair::new(),
-            meme: Pubkey::new_unique(),
-            router: Pubkey::default(),
-            pool_wsol: Pubkey::new_unique(),
-            pool_meme: Pubkey::new_unique(),
-            user_wsol: Pubkey::new_unique(),
-            user_meme: Pubkey::new_unique(),
-        }
-    }
-}
-
-#[test]
-fn router_fee_capped_and_fixed() {
+fn owner_settings_within_caps_and_two_step_ownership() {
     let mut env = Env::new();
-    let t = env.trader.insecure_clone();
-    let e = env.create_router(&t, env.trader_wallet, 26, [2; 32]).unwrap_err();
-    assert_eq!(custom_code(&e), Some(code(RouterError::AboveCap)));
-    let r = env.router_state(&env.router);
-    assert_eq!(r.trader_fee_bps, TRADER_BPS);
-    assert_eq!(r.owner, env.trader.pubkey());
-    // There is no instruction that changes a router's fee: the program simply has none.
-}
-
-#[test]
-fn owners_change_only_their_settings() {
-    let mut env = Env::new();
-    let stranger = Keypair::new();
-    env.svm.airdrop(&stranger.pubkey(), SOL).unwrap();
     let admin = env.admin.insecure_clone();
-    let set_min = |_env: &Env, who: &Pubkey, v: u64| Instruction {
+    let stranger = Keypair::new();
+    env.svm.airdrop(&stranger.pubkey(), SOL).unwrap();
+    let owner_only = |who: &Pubkey, data: Vec<u8>| Instruction {
         program_id: router::ID,
-        accounts: router::accounts::ConfigOwnerOnly { owner: *who, config: config_pda() }.to_account_metas(None),
-        data: router::instruction::SetMinFee { lamports: v }.data(),
+        accounts: router::accounts::ConfigV4OwnerOnly { owner: *who, config: config_pda() }.to_account_metas(None),
+        data,
     };
-    let ix = set_min(&env, &stranger.pubkey(), 0);
-    let e = env.send(&[ix], &stranger, &[]).unwrap_err();
-    assert_eq!(custom_code(&e), Some(code(RouterError::NotOwner)));
-    let ix = set_min(&env, &admin.pubkey(), MAX_MIN_FEE + 1);
-    let e = env.send(&[ix], &admin, &[]).unwrap_err();
-    assert_eq!(custom_code(&e), Some(code(RouterError::AboveCap)));
-    let ix = set_min(&env, &admin.pubkey(), MAX_MIN_FEE);
+    let ix = owner_only(&stranger.pubkey(), router::instruction::SetMinFeeV4 { lamports: 0 }.data());
+    assert_eq!(custom_code(&env.send(&[ix], &stranger, &[]).unwrap_err()), Some(code(RouterError::NotOwner)));
+    let ix = owner_only(&admin.pubkey(), router::instruction::SetMinFeeV4 { lamports: MAX_MIN_FEE + 1 }.data());
+    assert_eq!(custom_code(&env.send(&[ix], &admin, &[]).unwrap_err()), Some(code(RouterError::AboveCap)));
+    let ix = owner_only(&admin.pubkey(), router::instruction::SetMinFeeV4 { lamports: MAX_MIN_FEE }.data());
     env.send(&[ix], &admin, &[]).unwrap();
     assert_eq!(env.config().min_fee, MAX_MIN_FEE);
-
-    let set_wallet = |who: &Pubkey, router_key: Pubkey, w: Pubkey| Instruction {
+    // The vault is never a protocol wallet.
+    let ix = Instruction {
         program_id: router::ID,
-        accounts: router::accounts::SetFeeWallet {
-            owner: *who,
-            router: router_key,
-            vault: vault_pda(),
-            credit: credit_pda(&w),
-            system_program: solana_system_interface::program::ID,
-        }
-        .to_account_metas(None),
-        data: router::instruction::SetFeeWallet { wallet: w }.data(),
+        accounts: router::accounts::SetProtocolWalletV4 { owner: admin.pubkey(), config: config_pda(), vault: vault_pda(), wallet_credit: credit_pda(&vault_pda()), system_program: solana_system_interface::program::ID }.to_account_metas(None),
+        data: router::instruction::SetProtocolWalletV4 { wallet: vault_pda() }.data(),
     };
-    let ix = set_wallet(&stranger.pubkey(), env.router, stranger.pubkey());
-    let e = env.send(&[ix], &stranger, &[]).unwrap_err();
-    assert_eq!(custom_code(&e), Some(code(RouterError::NotOwner)));
-    let trader = env.trader.insecure_clone();
-    let ix = set_wallet(&trader.pubkey(), env.router, vault_pda());
-    let e = env.send(&[ix], &trader, &[]).unwrap_err();
-    assert_eq!(custom_code(&e), Some(code(RouterError::ZeroAddress)), "the vault is never a wallet");
-}
-
-#[test]
-fn two_step_ownership_for_config_and_router() {
-    let mut env = Env::new();
-    let admin = env.admin.insecure_clone();
+    assert_eq!(custom_code(&env.send(&[ix], &admin, &[]).unwrap_err()), Some(code(RouterError::ZeroAddress)));
+    // Two-step ownership.
     let next = Keypair::new();
     env.svm.airdrop(&next.pubkey(), SOL).unwrap();
-    let ix = Instruction {
-        program_id: router::ID,
-        accounts: router::accounts::ConfigOwnerOnly { owner: admin.pubkey(), config: config_pda() }.to_account_metas(None),
-        data: router::instruction::TransferConfigOwnership { new_owner: next.pubkey() }.data(),
-    };
+    let ix = owner_only(&admin.pubkey(), router::instruction::TransferOwnershipV4 { new_owner: next.pubkey() }.data());
     env.send(&[ix], &admin, &[]).unwrap();
     assert_eq!(env.config().owner, admin.pubkey(), "still the old owner until accepted");
-    let stranger = Keypair::new();
-    env.svm.airdrop(&stranger.pubkey(), SOL).unwrap();
     let accept = |who: &Pubkey| Instruction {
         program_id: router::ID,
-        accounts: router::accounts::AcceptConfigOwnership { new_owner: *who, config: config_pda() }.to_account_metas(None),
-        data: router::instruction::AcceptConfigOwnership {}.data(),
+        accounts: router::accounts::AcceptOwnershipV4 { new_owner: *who, config: config_pda() }.to_account_metas(None),
+        data: router::instruction::AcceptOwnershipV4 {}.data(),
     };
-    let e = env.send(&[accept(&stranger.pubkey())], &stranger, &[]).unwrap_err();
-    assert_eq!(custom_code(&e), Some(code(RouterError::NotPendingOwner)));
+    assert_eq!(custom_code(&env.send(&[accept(&stranger.pubkey())], &stranger, &[]).unwrap_err()), Some(code(RouterError::NotPendingOwner)));
     env.send(&[accept(&next.pubkey())], &next, &[]).unwrap();
     assert_eq!(env.config().owner, next.pubkey());
-
-    let trader = env.trader.insecure_clone();
-    let ix = Instruction {
-        program_id: router::ID,
-        accounts: router::accounts::RouterOwnerOnly { owner: trader.pubkey(), router: env.router }.to_account_metas(None),
-        data: router::instruction::TransferRouterOwnership { new_owner: next.pubkey() }.data(),
-    };
-    env.send(&[ix], &trader, &[]).unwrap();
-    let ix = Instruction {
-        program_id: router::ID,
-        accounts: router::accounts::AcceptRouterOwnership { new_owner: next.pubkey(), router: env.router }.to_account_metas(None),
-        data: router::instruction::AcceptRouterOwnership {}.data(),
-    };
-    env.send(&[ix], &next, &[]).unwrap();
-    assert_eq!(env.router_state(&env.router).owner, next.pubkey());
+    assert_eq!(env.config().pending_owner, Pubkey::default());
 }
 
 // ================================================================================ swaps and fees
@@ -519,8 +408,7 @@ fn buy_charges_exact_percentage_of_sol_in() {
     assert_eq!(env.lamports(&vault_pda()) - v0, fee, "exactly 0.40% of 50 SOL, not the signed max");
     assert_eq!(env.balance(&env.user_wsol), 50 * SOL);
     assert_eq!(env.balance(&env.user_meme), 1_000_000);
-    assert_eq!(env.credit(&env.protocol_wallet), fee * 25 / 40);
-    assert_eq!(env.credit(&env.trader_wallet), fee - fee * 25 / 40);
+    assert_eq!(env.credit(&env.protocol_wallet), fee, "no payee named: the whole fee is the protocol's");
     env.assert_solvent();
 }
 
@@ -589,7 +477,7 @@ fn unpriced_pair_and_same_token_refused() {
     env.token_account(user_other, other, u, 0);
     env.token_account(env.user_meme, env.meme, u, 1_000);
     let venue = env.venue_ix(&u, env.user_meme, user_other, env.meme, other, 1_000, 0);
-    let ix = env.execute_ix(&u, env.router, env.user_meme, user_other, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, env.user_meme, user_other, venue, 1, SOL, i64::MAX);
     let user = env.user.insecure_clone();
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::UnpricedPair)));
@@ -597,7 +485,7 @@ fn unpriced_pair_and_same_token_refused() {
     let second_wsol = Pubkey::new_unique();
     env.token_account(second_wsol, wsol(), u, 0);
     let venue = env.venue_ix(&u, env.user_wsol, second_wsol, wsol(), wsol(), SOL, 0);
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, second_wsol, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, env.user_wsol, second_wsol, venue, 1, SOL, i64::MAX);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::SameToken)));
 }
@@ -611,10 +499,10 @@ fn expired_and_zero_min_out_refused() {
     clock.unix_timestamp = 1_000_000;
     env.svm.set_sysvar(&clock);
     let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 10);
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue.clone(), 1, SOL, 999_999);
+    let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue.clone(), 1, SOL, 999_999);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::Expired)));
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 0, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 0, SOL, i64::MAX);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::ZeroMinOut)));
 }
@@ -628,7 +516,7 @@ fn blocked_venues_refused() {
     for blocked in [router::ID, router::NATIVE_PROGRAMS[0], solana_sdk_ids::bpf_loader_upgradeable::ID, solana_sdk_ids::stake::ID] {
         let mut venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 10);
         venue.program_id = blocked;
-        let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+        let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
         let e = env.send(&[ix], &user, &[]).unwrap_err();
         assert_eq!(custom_code(&e), Some(code(RouterError::VenueNotAllowed)), "{blocked}");
     }
@@ -648,7 +536,7 @@ impl Env {
     fn hostile_buy(&mut self, inner: Instruction, sol_in: u64, min_out: u64) -> Result<(), TransactionError> {
         let u = self.user.pubkey();
         let venue = self.relay(inner);
-        let ix = self.execute_ix_full(&u, self.router, self.user_wsol, self.user_meme, venue, min_out, SOL, sol_in, i64::MAX);
+        let ix = self.execute_ix_full(&u, self.user_wsol, self.user_meme, venue, min_out, SOL, sol_in, i64::MAX);
         let user = self.user.insecure_clone();
         self.send(&[ix], &user, &[])
     }
@@ -684,7 +572,7 @@ fn hostile_venue_reentering_the_router_refused() {
     let credited = env.config().total_credited;
     let collect = Instruction {
         program_id: router::ID,
-        accounts: router::accounts::Collect {
+        accounts: router::accounts::CollectV4 {
             config: config_pda(),
             vault: vault_pda(),
             credit: credit_pda(&env.protocol_wallet),
@@ -692,13 +580,13 @@ fn hostile_venue_reentering_the_router_refused() {
             system_program: solana_system_interface::program::ID,
         }
         .to_account_metas(None),
-        data: router::instruction::Collect {}.data(),
+        data: router::instruction::CollectV4 {}.data(),
     };
     let e = env.hostile_buy(collect, SOL, 1).unwrap_err();
     assert_eq!(e, TransactionError::InstructionError(0, InstructionError::ReentrancyNotAllowed));
     let u = env.user.pubkey();
     let inner = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 10);
-    let nested = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, inner, 1, SOL, i64::MAX);
+    let nested = env.execute_ix(&u, env.user_wsol, env.user_meme, inner, 1, SOL, i64::MAX);
     let e = env.hostile_buy(nested, SOL, 1).unwrap_err();
     assert_eq!(e, TransactionError::InstructionError(0, InstructionError::ReentrancyNotAllowed));
     assert_eq!(env.config().total_credited, credited, "no credit moved");
@@ -741,13 +629,13 @@ fn native_program_accounts_refused_when_writable() {
         env.svm.set_account(acc, Account { lamports, data: vec![1; len], owner, executable: false, rent_epoch: 0 }).unwrap();
         let mut venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 1_000);
         venue.accounts.push(solana_instruction::AccountMeta::new(acc, false));
-        let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+        let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
         let e = env.send(&[ix], &user, &[]).unwrap_err();
         assert_eq!(custom_code(&e), Some(code(RouterError::ProtectedAccount)), "{owner}");
 
         let mut venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 1_000);
         venue.accounts.push(solana_instruction::AccountMeta::new_readonly(acc, false));
-        let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+        let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
         env.send(&[ix], &user, &[]).unwrap();
     }
     env.assert_solvent();
@@ -764,7 +652,7 @@ impl Env {
         }
         let u = self.user.pubkey();
         let venue = Instruction { program_id: router::JUPITER_V6, accounts, data };
-        let ix = self.execute_ix(&u, self.router, self.user_wsol, self.user_meme, venue, 1, SOL, i64::MAX);
+        let ix = self.execute_ix(&u, self.user_wsol, self.user_meme, venue, 1, SOL, i64::MAX);
         let user = self.user.insecure_clone();
         self.send(&[ix], &user, &[])
     }
@@ -883,7 +771,7 @@ fn foreign_token_accounts_refused() {
     env.token_account(a_meme, env.meme, a, 0);
     // The attacker names the victim's wSOL account as the input.
     let venue = env.venue_ix(&a, env.user_wsol, a_meme, wsol(), env.meme, SOL, 10);
-    let ix = env.execute_ix(&a, env.router, env.user_wsol, a_meme, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&a, env.user_wsol, a_meme, venue, 1, SOL, i64::MAX);
     let e = env.send(&[ix], &attacker, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::NotUsersAccount)));
     assert_eq!(env.balance(&env.user_wsol), 100 * SOL, "victim untouched");
@@ -902,7 +790,7 @@ fn venue_cannot_spend_a_victims_tokens() {
     env.token_account(a_meme, env.meme, a, 0);
     let mut venue = env.venue_ix(&a, env.user_wsol, a_meme, wsol(), env.meme, SOL, 10);
     venue.accounts[0].pubkey = a; // signer = attacker, source = victim's account
-    let ix = env.execute_ix(&a, env.router, a_wsol, a_meme, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&a, a_wsol, a_meme, venue, 1, SOL, i64::MAX);
     assert!(env.send(&[ix], &attacker, &[]).is_err());
     assert_eq!(env.balance(&env.user_wsol), 100 * SOL, "victim untouched");
 }
@@ -913,25 +801,10 @@ fn wrong_credit_account_refused() {
     let u = env.user.pubkey();
     let user = env.user.insecure_clone();
     let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 10);
-    let mut ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
-    ix.accounts[4].pubkey = credit_pda(&u); // protocol_credit pointed at the user's own credit
+    let mut ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+    ix.accounts[3].pubkey = credit_pda(&u); // protocol_credit pointed at the user's own credit
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::WrongCreditAccount)));
-}
-
-#[test]
-fn fake_router_account_refused() {
-    // A router-shaped account owned by someone else's program is rejected by the owner check.
-    let mut env = Env::new();
-    let real = env.svm.get_account(&env.router).unwrap();
-    let fake = Pubkey::new_unique();
-    env.svm.set_account(fake, Account { owner: mock_swap::ID, ..real }).unwrap();
-    let u = env.user.pubkey();
-    let user = env.user.insecure_clone();
-    let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 10);
-    let mut ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
-    ix.accounts[2].pubkey = fake;
-    assert!(env.send(&[ix], &user, &[]).is_err());
 }
 
 // ================================================================================ credits and collection
@@ -941,7 +814,7 @@ fn collect_pays_only_the_wallet_and_keeps_the_vault_solvent() {
     let mut env = Env::new();
     env.buy(50 * SOL, 1_000_000, 1, SOL).unwrap();
     let fee = pct(50 * SOL, 40);
-    let p = fee * 25 / 40;
+    let p = fee; // no payee named
     let stranger = Keypair::new();
     env.svm.airdrop(&stranger.pubkey(), SOL).unwrap();
     let w0 = env.lamports(&env.protocol_wallet);
@@ -951,9 +824,6 @@ fn collect_pays_only_the_wallet_and_keeps_the_vault_solvent() {
     assert_eq!(env.lamports(&env.protocol_wallet) - w0, p, "paid to the protocol wallet");
     assert!(env.lamports(&stranger.pubkey()) < s0, "the caller only paid the transaction fee");
     assert_eq!(env.credit(&env.protocol_wallet), 0);
-    let tw = env.trader_wallet;
-    env.collect(tw, &stranger).unwrap();
-    assert_eq!(env.lamports(&env.trader_wallet), fee - p);
     assert_eq!(env.config().total_credited, 0);
     assert_eq!(env.lamports(&vault_pda()), env.vault_rent(), "the vault keeps exactly its rent reserve");
     // Collecting again pays nothing.
@@ -969,7 +839,7 @@ fn collect_with_a_mismatched_wallet_refused() {
     env.svm.airdrop(&stranger.pubkey(), SOL).unwrap();
     let ix = Instruction {
         program_id: router::ID,
-        accounts: router::accounts::Collect {
+        accounts: router::accounts::CollectV4 {
             config: config_pda(),
             vault: vault_pda(),
             credit: credit_pda(&env.protocol_wallet),
@@ -977,21 +847,10 @@ fn collect_with_a_mismatched_wallet_refused() {
             system_program: solana_system_interface::program::ID,
         }
         .to_account_metas(None),
-        data: router::instruction::Collect {}.data(),
+        data: router::instruction::CollectV4 {}.data(),
     };
     assert!(env.send(&[ix], &stranger, &[]).is_err());
-    assert_eq!(env.credit(&env.protocol_wallet), pct(SOL, 40) * 25 / 40, "credit untouched");
-}
-
-#[test]
-fn protocol_and_trader_wallet_may_be_the_same() {
-    let mut env = Env::new();
-    let t = env.trader.insecure_clone();
-    let pw = env.protocol_wallet;
-    env.router = env.create_router(&t, pw, TRADER_BPS, [9; 32]).unwrap();
-    env.buy(50 * SOL, 10, 1, SOL).unwrap();
-    assert_eq!(env.credit(&pw), pct(50 * SOL, 40), "both shares credited, none lost");
-    assert_eq!(env.config().total_credited, pct(50 * SOL, 40));
+    assert_eq!(env.credit(&env.protocol_wallet), MIN_FEE.max(pct(SOL, 40)), "credit untouched");
 }
 
 #[test]
@@ -1026,7 +885,7 @@ fn review_f1_decoy_input_refused() {
     let decoy = Pubkey::new_unique();
     env.token_account(decoy, wsol(), u, 0);
     let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, 50 * SOL, 1_000_000);
-    let ix = env.execute_ix(&u, env.router, decoy, env.user_meme, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, decoy, env.user_meme, venue, 1, SOL, i64::MAX);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::SwapAccountNotBound)));
     assert_eq!(env.balance(&env.user_wsol), 100 * SOL, "nothing moved");
@@ -1042,7 +901,7 @@ fn review_f1_delegated_source_refused() {
     let delegated = Pubkey::new_unique();
     env.delegated_wsol(delegated, lender, u, 50 * SOL);
     let venue = env.venue_ix(&u, delegated, env.user_meme, wsol(), env.meme, 50 * SOL, 1_000_000);
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::SwapAccountNotBound)));
 }
@@ -1054,7 +913,7 @@ fn zero_input_refused() {
     let u = env.user.pubkey();
     let user = env.user.insecure_clone();
     let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, 0, 1_000_000);
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::ZeroInput)));
 }
@@ -1066,10 +925,10 @@ fn max_input_enforced() {
     let u = env.user.pubkey();
     let user = env.user.insecure_clone();
     let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, 5 * SOL, 1_000);
-    let ix = env.execute_ix_full(&u, env.router, env.user_wsol, env.user_meme, venue.clone(), 1, SOL, 5 * SOL - 1, i64::MAX);
+    let ix = env.execute_ix_full(&u, env.user_wsol, env.user_meme, venue.clone(), 1, SOL, 5 * SOL - 1, i64::MAX);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::InputTooHigh)));
-    let ix = env.execute_ix_full(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, 5 * SOL, i64::MAX);
+    let ix = env.execute_ix_full(&u, env.user_wsol, env.user_meme, venue, 1, SOL, 5 * SOL, i64::MAX);
     env.send(&[ix], &user, &[]).unwrap();
 }
 
@@ -1087,7 +946,7 @@ fn second_signer_is_not_forwarded_to_the_swap() {
     env.token_account(other_wsol, wsol(), other.pubkey(), 50 * SOL);
     let mut venue = env.venue_ix(&other.pubkey(), other_wsol, env.user_meme, wsol(), env.meme, 50 * SOL, 1_000_000);
     venue.accounts[0].is_signer = true;
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
     let e = env.send(&[ix], &user, &[&other]).unwrap_err();
     assert_ne!(custom_code(&e), Some(code(RouterError::ZeroInput)), "stopped at the swap, not after it");
     assert_eq!(env.balance(&other_wsol), 50 * SOL, "the second signer's tokens never moved");
@@ -1108,7 +967,7 @@ fn multisig_account_refused() {
     env.svm.set_account(ms, Account { lamports, data, owner: token_program(), executable: false, rent_epoch: 0 }).unwrap();
     let mut venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 1_000);
     venue.accounts.push(solana_instruction::AccountMeta::new_readonly(ms, false));
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::MultisigNotAllowed)));
 }
@@ -1118,30 +977,16 @@ fn multisig_account_refused() {
 #[test]
 fn user_pays_exactly_the_fee_and_nothing_else() {
     let mut env = Env::new();
-    assert!(env.svm.get_account(&credit_pda(&env.protocol_wallet)).is_some(), "created at initialize");
-    assert!(env.svm.get_account(&credit_pda(&env.trader_wallet)).is_some(), "created at create_router");
+    assert!(env.svm.get_account(&credit_pda(&env.protocol_wallet)).is_some(), "created at initialize_v4");
     let relayer = Keypair::new();
     env.svm.airdrop(&relayer.pubkey(), SOL).unwrap();
     let u = env.user.pubkey();
     let user = env.user.insecure_clone();
     let l0 = env.lamports(&u);
     let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, 50 * SOL, 1_000);
-    let ix = env.execute_ix_full(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, 50 * SOL, i64::MAX);
+    let ix = env.execute_ix_full(&u, env.user_wsol, env.user_meme, venue, 1, SOL, 50 * SOL, i64::MAX);
     env.send(&[ix], &relayer, &[&user]).unwrap();
     assert_eq!(l0 - env.lamports(&u), pct(50 * SOL, 40), "SOL cost = exactly 0.40% of 50 SOL");
-}
-
-/// A pre-funded credit address (someone sent lamports there first) does not block creating it.
-#[test]
-fn prefunded_credit_address_still_works() {
-    let mut env = Env::new();
-    let wallet = Pubkey::new_unique();
-    env.svm.airdrop(&credit_pda(&wallet), 1_000_000).unwrap();
-    let t = env.trader.insecure_clone();
-    let r = env.create_router(&t, wallet, TRADER_BPS, [7; 32]).unwrap();
-    env.router = r;
-    env.buy(50 * SOL, 1_000, 1, SOL).unwrap();
-    assert_eq!(env.credit(&wallet), pct(50 * SOL, 40) - pct(50 * SOL, 40) * 25 / 40);
 }
 
 /// A failed fee check rolls back the swap AND leaves every credit untouched.
@@ -1149,12 +994,13 @@ fn prefunded_credit_address_still_works() {
 fn failed_fee_check_rolls_back_everything() {
     let mut env = Env::new();
     env.buy(SOL, 10, 1, SOL).unwrap();
-    let (p0, t0, tot0, w0) = (env.credit(&env.protocol_wallet), env.credit(&env.trader_wallet), env.config().total_credited, env.balance(&env.user_wsol));
+    let (p0, tot0, w0) = (env.credit(&env.protocol_wallet), env.config().total_credited, env.balance(&env.user_wsol));
     assert!(env.buy(50 * SOL, 10, 1, pct(50 * SOL, 40) - 1).is_err());
-    assert_eq!((env.credit(&env.protocol_wallet), env.credit(&env.trader_wallet), env.config().total_credited, env.balance(&env.user_wsol)), (p0, t0, tot0, w0));
+    assert_eq!((env.credit(&env.protocol_wallet), env.config().total_credited, env.balance(&env.user_wsol)), (p0, tot0, w0));
 }
 
-/// Changing the protocol wallet creates its credit account (paid by the owner); new fees go there, old ones stay.
+/// Changing the protocol wallet creates its credit account (paid by the owner; even if someone pre-funded the
+/// address); new fees go there, old ones stay.
 #[test]
 fn protocol_wallet_change_creates_credit_and_redirects_new_fees() {
     let mut env = Env::new();
@@ -1162,47 +1008,48 @@ fn protocol_wallet_change_creates_credit_and_redirects_new_fees() {
     let old = env.protocol_wallet;
     let old_credit = env.credit(&old);
     let new_wallet = Pubkey::new_unique();
+    env.svm.airdrop(&credit_pda(&new_wallet), 1_000_000).unwrap(); // pre-funded address
     let admin = env.admin.insecure_clone();
     let ix = Instruction {
         program_id: router::ID,
-        accounts: router::accounts::SetProtocolWallet {
+        accounts: router::accounts::SetProtocolWalletV4 {
             owner: admin.pubkey(),
             config: config_pda(),
             vault: vault_pda(),
-            credit: credit_pda(&new_wallet),
+            wallet_credit: credit_pda(&new_wallet),
             system_program: solana_system_interface::program::ID,
         }
         .to_account_metas(None),
-        data: router::instruction::SetProtocolWallet { wallet: new_wallet }.data(),
+        data: router::instruction::SetProtocolWalletV4 { wallet: new_wallet }.data(),
     };
     env.send(&[ix], &admin, &[]).unwrap();
     env.protocol_wallet = new_wallet;
     env.buy(50 * SOL, 10, 1, SOL).unwrap();
     assert_eq!(env.credit(&old), old_credit, "old credit stays with the old wallet");
-    assert_eq!(env.credit(&new_wallet), pct(50 * SOL, 40) * 25 / 40);
+    assert_eq!(env.credit(&new_wallet), pct(50 * SOL, 40));
 }
 
 // ================================================================================ security checklist (verification)
 
-/// Type confusion: a Router account handed to `collect` as the credit account. Anchor's account discriminator and
-/// seeds reject it; nothing is paid.
+/// Type confusion: the config account handed to `collect_v4` as the credit account. Anchor's account discriminator
+/// and seeds reject it; nothing is paid.
 #[test]
-fn router_account_cannot_pose_as_credit() {
+fn config_account_cannot_pose_as_credit() {
     let mut env = Env::new();
     env.buy(SOL, 10, 1, SOL).unwrap();
     let stranger = Keypair::new();
     env.svm.airdrop(&stranger.pubkey(), SOL).unwrap();
     let ix = Instruction {
         program_id: router::ID,
-        accounts: router::accounts::Collect {
+        accounts: router::accounts::CollectV4 {
             config: config_pda(),
             vault: vault_pda(),
-            credit: env.router,
+            credit: config_pda(),
             wallet: stranger.pubkey(),
             system_program: solana_system_interface::program::ID,
         }
         .to_account_metas(None),
-        data: router::instruction::Collect {}.data(),
+        data: router::instruction::CollectV4 {}.data(),
     };
     let v0 = env.lamports(&vault_pda());
     assert!(env.send(&[ix], &stranger, &[]).is_err());
@@ -1219,13 +1066,14 @@ fn fake_config_refused() {
     let u = env.user.pubkey();
     let user = env.user.insecure_clone();
     let venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 10);
-    let mut ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+    let mut ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
     ix.accounts[1].pubkey = fake;
     assert!(env.send(&[ix], &user, &[]).is_err());
 }
 
 /// Fee math, 20,000 deterministic pseudo-random cases including the extremes: the fee is max(floor, ceil(x * bps /
-/// 10,000)), never overflows, and the protocol and trader shares always add up to it exactly.
+/// 10,000)) for any rate up to 0.5%, never overflows, and the V4 split (payee share up to 60%, any community split)
+/// always adds up to it exactly with the protocol keeping at least 40%.
 #[test]
 fn fee_math_property() {
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -1238,15 +1086,18 @@ fn fee_math_property() {
     let edges = [0u64, 1, 9_999, 10_000, MIN_FEE, u64::MAX / 50, u64::MAX];
     for i in 0..20_000u64 {
         let amount = if (i as usize) < edges.len() { edges[i as usize] } else { next() >> (next() % 40) };
-        let trader = (next() % 26) as u64;
-        let bps = 25 + trader;
+        let bps = next() % 51;
         let p = router::pct(amount, bps).expect("never overflows u64 for bps <= 50");
         assert_eq!(p as u128, (amount as u128 * bps as u128).div_ceil(10_000));
         let fee = p.max(MIN_FEE);
-        let protocol = (fee as u128 * 25 / bps as u128) as u64;
-        let trader_share = fee - protocol;
-        assert_eq!(protocol + trader_share, fee);
-        assert!(protocol as u128 * bps as u128 <= fee as u128 * 25, "protocol never over-paid");
+        let share = next() % 6_001;
+        let split = next() % 10_001;
+        let pool = (fee as u128 * share as u128 / 10_000) as u64;
+        let community = (pool as u128 * split as u128 / 10_000) as u64;
+        let referral = pool - community;
+        let protocol = fee - pool;
+        assert_eq!(protocol + community + referral, fee);
+        assert!(protocol as u128 * 10_000 >= fee as u128 * 4_000, "protocol keeps at least 40%");
     }
 }
 
@@ -1261,7 +1112,7 @@ fn venue_cannot_leave_an_approval_behind() {
     let mut venue = env.venue_ix(&u, env.user_wsol, env.user_meme, wsol(), env.meme, SOL, 1_000);
     venue.data = mock_swap::instruction::SwapAndApprove { amount_in: SOL, amount_out: 1_000, delegate: thief }.data();
     venue.accounts.push(solana_instruction::AccountMeta::new_readonly(thief, false));
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
+    let ix = env.execute_ix(&u, env.user_wsol, env.user_meme, venue, 1, SOL, i64::MAX);
     let e = env.send(&[ix], &user, &[]).unwrap_err();
     assert_eq!(custom_code(&e), Some(code(RouterError::AccountAuthorityChanged)));
     let acc = TokenAccount::unpack(&env.svm.get_account(&env.user_wsol).unwrap().data).unwrap();
@@ -1292,9 +1143,7 @@ impl Env {
 
     #[allow(clippy::too_many_arguments)]
     fn execute_v2_ix(&self, input: Pubkey, output: Pubkey, venue: Instruction, min_out: u64, max_fee: u64, max_input: u64, max_wallet_spend: u64) -> Instruction {
-        let mut ix = self.execute_ix_full(&self.user.pubkey(), self.router, input, output, venue.clone(), min_out, max_fee, max_input, i64::MAX);
-        ix.data = router::instruction::ExecuteV2 { min_out, max_fee, max_input, max_wallet_spend, deadline: i64::MAX, swap_data: venue.data }.data();
-        ix
+        self.execute_ix_spend(&self.user.pubkey(), input, output, venue, min_out, max_fee, max_input, max_wallet_spend, i64::MAX)
     }
 
     /// Sends `ix` signed by the user with a separate fee payer, so the user's lamports move only by the swap and fee.
@@ -1365,31 +1214,21 @@ fn v2_wallet_spend_and_max_input_enforced() {
     env.assert_solvent();
 }
 
-/// Without a signed wallet spend the wallet stays read-only: `execute`, and `execute_v2` with 0, cannot reach it.
+/// Without a signed wallet spend (`max_wallet_spend` = 0) the wallet stays read-only: the venue cannot reach it.
 #[test]
 fn v2_zero_wallet_spend_keeps_the_wallet_read_only() {
     let mut env = Env::new();
     let venue = env.curve_ix(SOL, 1_000, 0, 0);
     let u = env.user.pubkey();
-    let ix = env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, venue.clone(), 1, SOL, i64::MAX);
-    let e = env.send_relayed(ix).unwrap_err();
-    assert_eq!(e, TransactionError::InstructionError(0, InstructionError::Custom(2000)), "venue sees a read-only wallet");
     let ix = env.execute_v2_ix(env.user_wsol, env.user_meme, venue, 1, SOL, u64::MAX, 0);
     let e = env.send_relayed(ix).unwrap_err();
     assert_eq!(e, TransactionError::InstructionError(0, InstructionError::Custom(2000)), "venue sees a read-only wallet");
     // A venue that just asks the System program to move the wallet's SOL: the runtime refuses it.
     let w0 = env.lamports(&u);
     let take = env.relay(solana_system_interface::instruction::transfer(&u, &Pubkey::new_unique(), SOL));
-    for v2 in [false, true] {
-        let ix = if v2 {
-            env.execute_v2_ix(env.user_wsol, env.user_meme, take.clone(), 1, SOL, u64::MAX, 0)
-        } else {
-            env.execute_ix(&u, env.router, env.user_wsol, env.user_meme, take.clone(), 1, SOL, i64::MAX)
-        };
-        let e = env.send_relayed(ix).unwrap_err();
-        println!("read-only wallet transfer (v2={v2}): {e:?}");
-        assert!(custom_code(&e).is_none(), "refused by the runtime, not a router check");
-    }
+    let ix = env.execute_v2_ix(env.user_wsol, env.user_meme, take, 1, SOL, u64::MAX, 0);
+    let e = env.send_relayed(ix).unwrap_err();
+    assert!(custom_code(&e).is_none(), "refused by the runtime, not a router check");
     assert_eq!(env.lamports(&u), w0);
     env.untouched();
 }
@@ -1531,7 +1370,7 @@ fn review_m2_unsynced_wsol_lamports_cannot_count_as_output() {
         let ix = if v2 {
             env.execute_v2_ix(env.user_meme, env.user_wsol, venue, 5 * SOL, SOL, u64::MAX, 1)
         } else {
-            env.execute_ix(&u, env.router, env.user_meme, env.user_wsol, venue, 5 * SOL, SOL, i64::MAX)
+            env.execute_ix(&u, env.user_meme, env.user_wsol, venue, 5 * SOL, SOL, i64::MAX)
         };
         let e = env.send_relayed(ix).unwrap_err();
         assert_eq!(custom_code(&e), Some(code(RouterError::AccountLamportsTaken)), "v2={v2}");
@@ -1566,11 +1405,119 @@ fn review_m2_token_account_surplus_lamports_protected() {
         let ix = if v2 {
             env.execute_v2_ix(env.user_wsol, acc, venue, 1, SOL, u64::MAX, 1)
         } else {
-            env.execute_ix(&u, env.router, env.user_wsol, acc, venue, 1, SOL, i64::MAX)
+            env.execute_ix(&u, env.user_wsol, acc, venue, 1, SOL, i64::MAX)
         };
         let e = env.send_relayed(ix).unwrap_err();
         assert_eq!(custom_code(&e), Some(code(RouterError::AccountLamportsTaken)), "v2={v2}");
     }
     assert_eq!(env.lamports(&thief), 0);
     assert_eq!(env.lamports(&acc), rent + SOL);
+}
+
+// ================================================================================ review 2026-10-07: authorities the user holds
+
+impl Env {
+    /// A buy through the hostile venue: a real 1 SOL swap (so the measured checks pass) followed by `extra`.
+    fn buy_then(&mut self, extra: Instruction) -> Result<(), TransactionError> {
+        let u = self.user.pubkey();
+        let swap = self.venue_ix(&u, self.user_wsol, self.user_meme, wsol(), self.meme, SOL, 1_000);
+        let venue = self.relay_many(vec![swap, extra]);
+        let ix = self.execute_ix_full(&u, self.user_wsol, self.user_meme, venue, 1, SOL, SOL, i64::MAX);
+        let user = self.user.insecure_clone();
+        self.send(&[ix], &user, &[])
+    }
+}
+
+/// Review #1: a wSOL account owned by someone else with the USER as close authority: closing it with the user's
+/// signature would send its whole SOL to the venue's choice. Refused.
+#[test]
+fn review2_close_authority_account_refused() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let victim = Pubkey::new_unique();
+    let rent = env.svm.minimum_balance_for_rent_exemption(TokenAccount::LEN);
+    let mut data = vec![0u8; TokenAccount::LEN];
+    TokenAccount {
+        mint: wsol(),
+        owner: Pubkey::new_unique(),
+        amount: 5 * SOL,
+        delegate: COption::None,
+        state: AccountState::Initialized,
+        is_native: COption::Some(rent),
+        delegated_amount: 0,
+        close_authority: COption::Some(u),
+    }
+    .pack_into_slice(&mut data);
+    env.svm.set_account(victim, Account { lamports: rent + 5 * SOL, data, owner: token_program(), executable: false, rent_epoch: 0 }).unwrap();
+    let thief = Pubkey::new_unique();
+    let close = spl_token_interface::instruction::close_account(&token_program(), &victim, &thief, &u, &[]).unwrap();
+    let e = env.buy_then(close).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::SwapAccountNotBound)));
+    assert_eq!(env.lamports(&thief), 0);
+    assert_eq!(env.lamports(&victim), rent + 5 * SOL);
+}
+
+/// Review #2: a mint the USER is mint authority of, handed to the swap writable: the venue could move the authority
+/// with the user's signature. Refused (a read-only mint stays allowed).
+#[test]
+fn review2_user_mint_authority_refused_when_writable() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let mint = Pubkey::new_unique();
+    let mut data = vec![0u8; Mint::LEN];
+    Mint { mint_authority: COption::Some(u), supply: 0, decimals: 6, is_initialized: true, freeze_authority: COption::None }.pack_into_slice(&mut data);
+    let lamports = env.svm.minimum_balance_for_rent_exemption(Mint::LEN);
+    env.svm.set_account(mint, Account { lamports, data, owner: token_program(), executable: false, rent_epoch: 0 }).unwrap();
+    let thief = Pubkey::new_unique();
+    let take = spl_token_interface::instruction::set_authority(&token_program(), &mint, Some(&thief), spl_token_interface::instruction::AuthorityType::MintTokens, &u, &[]).unwrap();
+    let e = env.buy_then(take).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::AuthorityExposed)));
+    let m = Mint::unpack(&env.svm.get_account(&mint).unwrap().data).unwrap();
+    assert_eq!(m.mint_authority, COption::Some(u), "authority unchanged");
+}
+
+/// Review #3: a Token-2022 mint whose permanent delegate is the USER: a holder's account of that mint, handed to the
+/// swap writable, could be drained with the user's signature. Refused.
+#[test]
+fn review2_permanent_delegate_refused() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let t22 = spl_token_2022_interface::ID;
+    // Mint with the PermanentDelegate extension: base (82) | padding to 165 | account type 1 | TLV type 12, len 32, key.
+    let mint = Pubkey::new_unique();
+    let mut mdata = vec![0u8; 165 + 1 + 4 + 32];
+    Mint { mint_authority: COption::None, supply: 1_000_000, decimals: 6, is_initialized: true, freeze_authority: COption::None }.pack_into_slice(&mut mdata[..Mint::LEN]);
+    mdata[165] = 1;
+    mdata[166..168].copy_from_slice(&12u16.to_le_bytes());
+    mdata[168..170].copy_from_slice(&32u16.to_le_bytes());
+    mdata[170..202].copy_from_slice(u.as_ref());
+    let ml = env.svm.minimum_balance_for_rent_exemption(mdata.len());
+    env.svm.set_account(mint, Account { lamports: ml, data: mdata, owner: t22, executable: false, rent_epoch: 0 }).unwrap();
+    let holder = Pubkey::new_unique();
+    let thief = Pubkey::new_unique();
+    let rent = env.svm.minimum_balance_for_rent_exemption(TokenAccount::LEN);
+    for (addr, owner, amount) in [(holder, Pubkey::new_unique(), 1_000_000u64), (thief, Pubkey::new_unique(), 0)] {
+        let mut d = vec![0u8; TokenAccount::LEN];
+        TokenAccount { mint, owner, amount, delegate: COption::None, state: AccountState::Initialized, is_native: COption::None, delegated_amount: 0, close_authority: COption::None }.pack_into_slice(&mut d);
+        env.svm.set_account(addr, Account { lamports: rent, data: d, owner: t22, executable: false, rent_epoch: 0 }).unwrap();
+    }
+    let take = spl_token_2022_interface::instruction::transfer_checked(&t22, &holder, &mint, &thief, &u, &[], 1_000_000, 6).unwrap();
+    let e = env.buy_then(take).unwrap_err();
+    assert_eq!(custom_code(&e), Some(code(RouterError::AuthorityExposed)));
+    assert_eq!(TokenAccount::unpack(&env.svm.get_account(&holder).unwrap().data).unwrap().amount, 1_000_000, "holder untouched");
+}
+
+/// Review #2, the legitimate side: a creator who still holds the MINT authority of the token they trade can trade it;
+/// the mint reaches the swap read-only, so no authority is exposed.
+#[test]
+fn review2_creator_with_mint_authority_can_trade() {
+    let mut env = Env::new();
+    let u = env.user.pubkey();
+    let meme = env.meme;
+    let mut data = vec![0u8; Mint::LEN];
+    Mint { mint_authority: COption::Some(u), supply: 0, decimals: 6, is_initialized: true, freeze_authority: COption::None }.pack_into_slice(&mut data);
+    let lamports = env.svm.minimum_balance_for_rent_exemption(Mint::LEN);
+    env.svm.set_account(meme, Account { lamports, data, owner: token_program(), executable: false, rent_epoch: 0 }).unwrap();
+    env.buy(SOL, 1_000, 1, SOL).unwrap();
+    assert_eq!(env.balance(&env.user_meme), 1_000);
 }

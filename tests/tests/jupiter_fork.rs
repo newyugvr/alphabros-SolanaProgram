@@ -6,10 +6,10 @@
 //! Each snapshot holds a real Jupiter swap instruction for a fresh test user plus every account it touches, taken
 //! from mainnet at one slot: the Jupiter and DEX programs' code, pool state, mints and lookup tables. The test loads
 //! them into LiteSVM at that slot, deploys the router (venues are permissionless; Jupiter is just the one used), and sends
-//! `execute` wrapping Jupiter's instruction in a v0 transaction with Jupiter's lookup tables, exactly as the app
+//! `execute_v4` wrapping Jupiter's instruction in a v0 transaction with Jupiter's lookup tables, exactly as the app
 //! will. Checks: output >= Jupiter's minimum, the exact fee on the SOL side, the user's binding and authority
 //! checks pass on a real route, transaction size and compute fit Solana's limits.
-use alphabros_router::{self as router, Config};
+use alphabros_router::{self as router, ConfigV4};
 use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use base64::Engine;
 use litesvm::LiteSVM;
@@ -33,7 +33,7 @@ const NATIVE_LOADER: &str = "NativeLoader1111111111111111111111111111111";
 const COMPUTE_BUDGET: &str = "ComputeBudget111111111111111111111111111111";
 const MIN_FEE: u64 = 2_500_000;
 const MAX_MIN_FEE: u64 = 50_000_000;
-const TRADER_BPS: u16 = 15;
+const FEE_BPS: u16 = 40; // 0.40%
 const MAX_TX_BYTES: usize = 1232;
 
 fn pk(s: &str) -> Pubkey {
@@ -140,21 +140,17 @@ fn run_with(name: &str, tamper: Tamper) -> Option<Result<Outcome, String>> {
 
     // 2. The router.
     let admin = Keypair::new();
-    let trader = Keypair::new();
     let protocol_wallet = Pubkey::new_unique();
-    let trader_wallet = Pubkey::new_unique();
     svm.add_program_from_file(router::ID, ROUTER_SO).expect("build the router first");
     set_upgrade_authority(&mut svm, &router::ID, &admin.pubkey());
-    for k in [&admin, &trader] {
-        svm.airdrop(&k.pubkey(), 10_000_000_000).unwrap();
-    }
-    let config = pda(&[router::CONFIG_SEED], &router::ID);
-    let vault = pda(&[router::VAULT_SEED], &router::ID);
-    let credit = |w: &Pubkey| pda(&[router::CREDIT_SEED, w.as_ref()], &router::ID);
+    svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
+    let config = pda(&[router::CONFIG_V4_SEED], &router::ID);
+    let vault = pda(&[router::VAULT_V4_SEED], &router::ID);
+    let credit = |w: &Pubkey| pda(&[router::CREDIT_V4_SEED, w.as_ref()], &router::ID);
     let programdata = Pubkey::find_program_address(&[router::ID.as_ref()], &solana_sdk_ids::bpf_loader_upgradeable::ID).0;
     let init = Instruction {
         program_id: router::ID,
-        accounts: router::accounts::Initialize {
+        accounts: router::accounts::InitializeV4 {
             payer: admin.pubkey(),
             config,
             vault,
@@ -164,30 +160,18 @@ fn run_with(name: &str, tamper: Tamper) -> Option<Result<Outcome, String>> {
             system_program: solana_system_interface::program::ID,
         }
         .to_account_metas(None),
-        data: router::instruction::Initialize {
+        data: router::instruction::InitializeV4 {
             owner: admin.pubkey(),
             protocol_wallet,
             min_fee: MIN_FEE,
             max_min_fee: MAX_MIN_FEE,
+            fee_bps: FEE_BPS,
+            payee_share_bps: 6_000,
+            community_split_bps: 5_000,
         }
         .data(),
     };
     send_legacy(&mut svm, &[init], &admin).expect("initialize");
-    let salt = [7u8; 32];
-    let router_key = pda(&[router::ROUTER_SEED, trader.pubkey().as_ref(), &salt], &router::ID);
-    let create = Instruction {
-        program_id: router::ID,
-        accounts: router::accounts::CreateRouter {
-            owner: trader.pubkey(),
-            router: router_key,
-            vault,
-            fee_credit: credit(&trader_wallet),
-            system_program: solana_system_interface::program::ID,
-        }
-        .to_account_metas(None),
-        data: router::instruction::CreateRouter { fee_wallet: trader_wallet, trader_fee_bps: TRADER_BPS, salt }.data(),
-    };
-    send_legacy(&mut svm, &[create], &trader).expect("create_router");
 
     // 3. The user Jupiter built the route for, with the input in their token account.
     let seed: [u8; 32] = b64(snap.s("userSeed")).try_into().unwrap();
@@ -201,7 +185,7 @@ fn run_with(name: &str, tamper: Tamper) -> Option<Result<Outcome, String>> {
     token_account(&mut svm, user_in, input, user.pubkey(), amount, pk(snap.s("inputTokenProgram")), input == wsol);
     token_account(&mut svm, user_out, output, user.pubkey(), 0, pk(snap.s("outputTokenProgram")), output == wsol);
 
-    // 4. execute wrapping Jupiter's real instruction.
+    // 4. execute_v4 wrapping Jupiter's real instruction (no community or referral: the whole fee is the protocol's).
     let ix = &snap.0["swapIx"];
     let mut jup_metas: Vec<AccountMeta> = ix["accounts"]
         .as_array()
@@ -216,13 +200,13 @@ fn run_with(name: &str, tamper: Tamper) -> Option<Result<Outcome, String>> {
     let mut swap_data = b64(ix["data"].as_str().unwrap());
     tamper(&mut svm, &mut jup_metas, &mut swap_data);
     let min_out: u64 = snap.0["quote"]["otherAmountThreshold"].as_str().unwrap().parse().unwrap();
-    let mut metas = router::accounts::Execute {
+    let mut metas = router::accounts::ExecuteV4 {
         user: user.pubkey(),
         config,
-        router: router_key,
         vault,
         protocol_credit: credit(&protocol_wallet),
-        trader_credit: credit(&trader_wallet),
+        community_payee: None,
+        referral_payee: None,
         input_account: user_in,
         output_account: user_out,
         swap_program: pk(JUPITER),
@@ -233,12 +217,15 @@ fn run_with(name: &str, tamper: Tamper) -> Option<Result<Outcome, String>> {
     let execute = Instruction {
         program_id: router::ID,
         accounts: metas,
-        data: router::instruction::Execute {
+        data: router::instruction::ExecuteV4 {
             min_out,
             max_fee: MAX_MIN_FEE,
             max_input: amount,
+            max_wallet_spend: 0,
             deadline: i64::MAX,
             swap_data,
+            community: None,
+            referral: None,
         }
         .data(),
     };
@@ -281,7 +268,7 @@ fn run_with(name: &str, tamper: Tamper) -> Option<Result<Outcome, String>> {
     let received = token_amount(&svm, &user_out);
     let fee = read_config(&svm, &config).total_credited - cfg0;
     let sol_side = if input == wsol { spent } else { received };
-    let expected = pct(sol_side, 25 + TRADER_BPS as u64).max(MIN_FEE);
+    let expected = pct(sol_side, FEE_BPS as u64).max(MIN_FEE);
     let user_sol = lamports0 - svm.get_account(&user.pubkey()).unwrap().lamports;
     assert!(received >= min_out, "{name}: received {received} < Jupiter's minimum {min_out}");
     assert_eq!(spent, amount, "{name}: the whole input was spent");
@@ -299,8 +286,8 @@ fn run_with(name: &str, tamper: Tamper) -> Option<Result<Outcome, String>> {
     Some(Ok(Outcome { report, received, quoted }))
 }
 
-fn read_config(svm: &LiteSVM, config: &Pubkey) -> Config {
-    Config::try_deserialize(&mut &svm.get_account(config).unwrap().data[..]).unwrap()
+fn read_config(svm: &LiteSVM, config: &Pubkey) -> ConfigV4 {
+    ConfigV4::try_deserialize(&mut &svm.get_account(config).unwrap().data[..]).unwrap()
 }
 
 fn send_legacy(svm: &mut LiteSVM, ixs: &[Instruction], payer: &Keypair) -> Result<(), String> {
