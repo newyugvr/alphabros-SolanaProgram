@@ -4,20 +4,20 @@
     "name": "alphabros_router",
     "version": "0.1.0",
     "spec": "0.1.0",
-    "description": "Alphabros V2 fee router for Solana: per-trader routers, exact fee in SOL, swaps through any venue (permissionless)"
+    "description": "Alphabros V4 fee router for Solana: one config, community + referral payees signed once for EVM and Solana, exact fee in SOL, swaps through any venue (permissionless)"
   },
   "instructions": [
     {
-      "name": "accept_config_ownership",
+      "name": "accept_ownership_v4",
       "discriminator": [
-        6,
-        212,
-        14,
-        48,
-        229,
-        38,
-        62,
-        241
+        179,
+        2,
+        185,
+        161,
+        206,
+        123,
+        233,
+        224
       ],
       "accounts": [
         {
@@ -37,7 +37,10 @@
                   110,
                   102,
                   105,
-                  103
+                  103,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
@@ -47,43 +50,19 @@
       "args": []
     },
     {
-      "name": "accept_router_ownership",
-      "discriminator": [
-        78,
-        208,
-        124,
-        196,
-        119,
-        47,
-        153,
-        203
-      ],
-      "accounts": [
-        {
-          "name": "new_owner",
-          "signer": true
-        },
-        {
-          "name": "router",
-          "writable": true
-        }
-      ],
-      "args": []
-    },
-    {
-      "name": "collect",
+      "name": "collect_payee",
       "docs": [
-        "Pays `wallet` everything credited to it. Anyone may trigger it; the lamports only ever go to `wallet`."
+        "Pays a community or referral everything it earned, to its current payout wallet. Anyone may trigger it."
       ],
       "discriminator": [
-        208,
-        47,
-        194,
-        155,
-        17,
-        98,
-        82,
-        236
+        232,
+        173,
+        146,
+        220,
+        13,
+        252,
+        113,
+        222
       ],
       "accounts": [
         {
@@ -99,7 +78,10 @@
                   110,
                   102,
                   105,
-                  103
+                  103,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
@@ -117,7 +99,84 @@
                   97,
                   117,
                   108,
-                  116
+                  116,
+                  95,
+                  118,
+                  52
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "payee",
+          "writable": true
+        },
+        {
+          "name": "wallet",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "collect_v4",
+      "docs": [
+        "Pays a wallet its V4 credit (the protocol wallet's fees). Anyone may trigger it; the lamports only go to `wallet`."
+      ],
+      "discriminator": [
+        227,
+        41,
+        43,
+        82,
+        205,
+        34,
+        152,
+        30
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  118,
+                  52
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
@@ -136,7 +195,10 @@
                   101,
                   100,
                   105,
-                  116
+                  116,
+                  95,
+                  118,
+                  52
                 ]
               },
               {
@@ -158,173 +220,69 @@
       "args": []
     },
     {
-      "name": "create_router",
+      "name": "execute_v4",
       "docs": [
-        "Anyone creates a router. The signer owns it; `fee_wallet` receives the trader's share; the trader fee is fixed",
-        "forever (another rate = another router, with another salt). The fee wallet's credit account is created here,",
-        "paid by the router owner, so no swap ever pays for it."
+        "The swap: the user signs `max_wallet_spend` (0 keeps the wallet read-only; above zero, only bonding-curve style",
+        "venues that trade the wallet's own SOL need it, and the wallet must stay a plain system account), the fee",
+        "(max(floor, SOL side x fee rate), at most `max_fee`), and the payee share to the community and/or referral the",
+        "trade names. Each named payee must be registered as its kind with exactly the wallet the trade expects, or the",
+        "swap reverts; a payee whose wallet is the user or the protocol wallet earns nothing. Pass the payee accounts as",
+        "`community_payee` / `referral_payee` (or none)."
       ],
       "discriminator": [
+        213,
+        209,
         75,
-        219,
-        162,
-        173,
-        199,
-        87,
-        169,
-        123
+        3,
+        58,
+        220,
+        180,
+        27
       ],
       "accounts": [
         {
-          "name": "owner",
+          "name": "user",
           "writable": true,
           "signer": true
         },
         {
-          "name": "router",
+          "name": "config",
           "writable": true,
           "pda": {
             "seeds": [
               {
                 "kind": "const",
                 "value": [
-                  114,
+                  99,
                   111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  118,
+                  52
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
                   117,
+                  108,
                   116,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "owner"
-              },
-              {
-                "kind": "arg",
-                "path": "salt"
-              }
-            ]
-          }
-        },
-        {
-          "name": "vault",
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
+                  95,
                   118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "fee_credit",
-          "writable": true
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "fee_wallet",
-          "type": "pubkey"
-        },
-        {
-          "name": "trader_fee_bps",
-          "type": "u16"
-        },
-        {
-          "name": "salt",
-          "type": {
-            "array": [
-              "u8",
-              32
-            ]
-          }
-        }
-      ]
-    },
-    {
-      "name": "execute",
-      "docs": [
-        "Swap through `router`, paying at most `max_fee` lamports and spending at most `max_input` of the input token.",
-        "",
-        "The swap is `swap_data` sent to `swap_program` (any venue the user signed for, except the blocked ones) with",
-        "`remaining_accounts`, carrying the user's signature. The venue may pass that signature on to the programs it",
-        "calls, so the router BINDS the swap to the measured accounts: among the accounts handed to the swap, the only",
-        "writable token accounts the user owns (or is a delegate of) may be `input_account` and `output_account`, no SPL",
-        "multisig may appear, no account a native program owns may be writable (nor a system account holding data, such",
-        "as a durable nonce), only the user's signature is passed on, and the user's wallet is read-only. The swap",
-        "therefore has nothing of the user's to spend except `input_account`, and it must leave the owner, delegate and",
-        "close authority of both measured accounts unchanged. For Jupiter v6 the instruction must be a route with its",
-        "platform fee off.",
-        "",
-        "After the swap: spent > 0, spent <= max_input, received >= min_out, and the fee is exactly",
-        "max(min_fee, ceil(wSOL side x total bps / 10_000)) from the user's SOL, reverting if above `max_fee`. That fee is",
-        "this router's only SOL debit from the user (no account is created during a swap); network fees and the app's",
-        "wrap/unwrap instructions are outside it. For a SOL trade the app wraps SOL into the user's wSOL account before",
-        "this instruction (and may unwrap after)."
-      ],
-      "discriminator": [
-        130,
-        221,
-        242,
-        154,
-        13,
-        193,
-        189,
-        29
-      ],
-      "accounts": [
-        {
-          "name": "user",
-          "writable": true,
-          "signer": true
-        },
-        {
-          "name": "config",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "router"
-        },
-        {
-          "name": "vault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
+                  52
                 ]
               }
             ]
@@ -335,137 +293,14 @@
           "writable": true
         },
         {
-          "name": "trader_credit",
-          "docs": [
-            "equal `protocol_credit`."
-          ],
-          "writable": true
-        },
-        {
-          "name": "input_account",
-          "docs": [
-            "The user's token account the swap pays from."
-          ],
-          "writable": true
-        },
-        {
-          "name": "output_account",
-          "docs": [
-            "The user's token account the swap pays into."
-          ],
-          "writable": true
-        },
-        {
-          "name": "swap_program"
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
-        }
-      ],
-      "args": [
-        {
-          "name": "min_out",
-          "type": "u64"
-        },
-        {
-          "name": "max_fee",
-          "type": "u64"
-        },
-        {
-          "name": "max_input",
-          "type": "u64"
-        },
-        {
-          "name": "deadline",
-          "type": "i64"
-        },
-        {
-          "name": "swap_data",
-          "type": "bytes"
-        }
-      ]
-    },
-    {
-      "name": "execute_v2",
-      "docs": [
-        "`execute` for venues that trade the wallet's own SOL (bonding curves such as Pump.fun, and AMMs that take a",
-        "SOL fee or rent from the wallet). The wallet is writable in the swap when `max_wallet_spend` is above zero, and",
-        "the swap may take at most `max_wallet_spend` lamports from it (never above `MAX_WALLET_SPEND`). After the swap",
-        "the wallet must still be a plain system account (System-owned, no data): an Assign or Allocate of the wallet",
-        "reverts. Every other rule of `execute` holds.",
-        "",
-        "The wallet's SOL counts on the SOL side, NET: the SOL side is the signed sum of the wSOL account's change and",
-        "the wallet's change, so on a buy `spent` is the net SOL that left both, and on a sell `received` is the net SOL",
-        "that arrived in both (a loss on either side is subtracted, never ignored). `max_input`, `min_out` and the fee",
-        "apply to those net amounts. The router's own fee is taken after this measurement."
-      ],
-      "discriminator": [
-        110,
-        12,
-        255,
-        88,
-        93,
-        207,
-        223,
-        214
-      ],
-      "accounts": [
-        {
-          "name": "user",
+          "name": "community_payee",
           "writable": true,
-          "signer": true
+          "optional": true
         },
         {
-          "name": "config",
+          "name": "referral_payee",
           "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  111,
-                  110,
-                  102,
-                  105,
-                  103
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "router"
-        },
-        {
-          "name": "vault",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  118,
-                  97,
-                  117,
-                  108,
-                  116
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "name": "protocol_credit",
-          "writable": true
-        },
-        {
-          "name": "trader_credit",
-          "docs": [
-            "equal `protocol_credit`."
-          ],
-          "writable": true
+          "optional": true
         },
         {
           "name": "input_account",
@@ -513,24 +348,45 @@
         {
           "name": "swap_data",
           "type": "bytes"
+        },
+        {
+          "name": "community",
+          "type": {
+            "option": {
+              "defined": {
+                "name": "Party"
+              }
+            }
+          }
+        },
+        {
+          "name": "referral",
+          "type": {
+            "option": {
+              "defined": {
+                "name": "Party"
+              }
+            }
+          }
         }
       ]
     },
     {
-      "name": "initialize",
+      "name": "initialize_v4",
       "docs": [
-        "One-time setup, by the program's upgrade authority only (so nobody can front-run it after deploy). Creates the",
-        "protocol wallet's credit account here, paid by the deployer, so no swap ever pays for it."
+        "One-time V4 setup, by the program's upgrade authority only. The fee rate (at most 0.5%), the payee share (at",
+        "most 60% of the fee) and the community split (when a trade names both payees) are the starting values; the",
+        "owner changes them later, never above the caps. Creates the protocol wallet's V4 credit account."
       ],
       "discriminator": [
-        175,
-        175,
-        109,
+        183,
+        253,
+        226,
+        43,
+        74,
+        81,
         31,
-        13,
-        152,
-        155,
-        237
+        95
       ],
       "accounts": [
         {
@@ -551,7 +407,10 @@
                   110,
                   102,
                   105,
-                  103
+                  103,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
@@ -569,7 +428,10 @@
                   97,
                   117,
                   108,
-                  116
+                  116,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
@@ -607,36 +469,47 @@
         {
           "name": "max_min_fee",
           "type": "u64"
+        },
+        {
+          "name": "fee_bps",
+          "type": "u16"
+        },
+        {
+          "name": "payee_share_bps",
+          "type": "u16"
+        },
+        {
+          "name": "community_split_bps",
+          "type": "u16"
         }
       ]
     },
     {
-      "name": "set_fee_wallet",
+      "name": "register_payee",
       "docs": [
-        "Router owner: where future trader shares go (its credit account is created now, paid by the owner). Credits",
-        "already earned stay with the old wallet."
+        "Stores a community's or referral's signed registration (anyone may send it; only the owner's EVM signature,",
+        "the same EIP-712 message the EVM router checks, makes it valid). The payee account is created on first use,",
+        "paid by `payer`. A version at or below the stored one changes nothing; a higher one moves the payout wallet",
+        "(what is already earned is then collected to the new wallet)."
       ],
       "discriminator": [
-        108,
-        242,
-        79,
-        79,
-        203,
-        119,
-        109,
-        211
+        235,
+        232,
+        8,
+        70,
+        208,
+        236,
+        186,
+        182
       ],
       "accounts": [
         {
-          "name": "owner",
+          "name": "payer",
           "writable": true,
-          "signer": true,
-          "relations": [
-            "router"
-          ]
+          "signer": true
         },
         {
-          "name": "router",
+          "name": "payee",
           "writable": true
         },
         {
@@ -650,15 +523,14 @@
                   97,
                   117,
                   108,
-                  116
+                  116,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
           }
-        },
-        {
-          "name": "credit",
-          "writable": true
         },
         {
           "name": "system_program",
@@ -667,25 +539,30 @@
       ],
       "args": [
         {
-          "name": "wallet",
-          "type": "pubkey"
+          "name": "reg",
+          "type": {
+            "defined": {
+              "name": "Registration"
+            }
+          }
         }
       ]
     },
     {
-      "name": "set_min_fee",
+      "name": "set_fee_bps_v4",
       "docs": [
-        "Config owner: the floor, in lamports, never above the cap fixed at initialize."
+        "The fee rate, in basis points of the trade's SOL side (30 = 0.3%); at most 0.5%. A user signs `max_fee`, so a",
+        "raise never takes more than that."
       ],
       "discriminator": [
-        114,
-        198,
-        35,
-        3,
-        41,
-        196,
-        194,
-        246
+        143,
+        96,
+        39,
+        65,
+        98,
+        174,
+        186,
+        238
       ],
       "accounts": [
         {
@@ -708,7 +585,63 @@
                   110,
                   102,
                   105,
-                  103
+                  103,
+                  95,
+                  118,
+                  52
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "fee_bps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
+      "name": "set_min_fee_v4",
+      "docs": [
+        "The floor, lamports; at most the cap fixed at `initialize_v4`."
+      ],
+      "discriminator": [
+        184,
+        84,
+        221,
+        137,
+        90,
+        217,
+        210,
+        58
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
@@ -723,20 +656,20 @@
       ]
     },
     {
-      "name": "set_protocol_wallet",
+      "name": "set_protocol_wallet_v4",
       "docs": [
-        "Config owner: where future protocol shares go (its credit account is created now, paid by the owner). Credits",
-        "already earned stay with the old wallet."
+        "Future protocol fees go to `wallet`; what the old wallet earned stays its own to collect. Creates the new",
+        "wallet's V4 credit account (paid by the owner) so no swap ever pays for it."
       ],
       "discriminator": [
-        118,
         54,
-        197,
-        41,
-        122,
-        139,
-        65,
-        174
+        159,
+        143,
+        229,
+        108,
+        4,
+        201,
+        12
       ],
       "accounts": [
         {
@@ -760,7 +693,10 @@
                   110,
                   102,
                   105,
-                  103
+                  103,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
@@ -777,14 +713,17 @@
                   97,
                   117,
                   108,
-                  116
+                  116,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
           }
         },
         {
-          "name": "credit",
+          "name": "wallet_credit",
           "writable": true
         },
         {
@@ -800,16 +739,20 @@
       ]
     },
     {
-      "name": "transfer_config_ownership",
+      "name": "set_shares_v4",
+      "docs": [
+        "The payee share (basis points of the fee, at most 60%) and the community's part of it when a trade names both",
+        "payees (basis points of the share). Applies to fees settled from now on."
+      ],
       "discriminator": [
-        53,
-        124,
-        67,
-        226,
-        108,
-        130,
-        19,
-        12
+        88,
+        133,
+        47,
+        87,
+        28,
+        237,
+        56,
+        90
       ],
       "accounts": [
         {
@@ -832,7 +775,64 @@
                   110,
                   102,
                   105,
-                  103
+                  103,
+                  95,
+                  118,
+                  52
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "payee_share_bps",
+          "type": "u16"
+        },
+        {
+          "name": "community_split_bps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
+      "name": "transfer_ownership_v4",
+      "discriminator": [
+        11,
+        14,
+        76,
+        6,
+        111,
+        136,
+        54,
+        201
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103,
+                  95,
+                  118,
+                  52
                 ]
               }
             ]
@@ -845,52 +845,20 @@
           "type": "pubkey"
         }
       ]
-    },
-    {
-      "name": "transfer_router_ownership",
-      "discriminator": [
-        186,
-        130,
-        145,
-        70,
-        149,
-        176,
-        47,
-        18
-      ],
-      "accounts": [
-        {
-          "name": "owner",
-          "signer": true,
-          "relations": [
-            "router"
-          ]
-        },
-        {
-          "name": "router",
-          "writable": true
-        }
-      ],
-      "args": [
-        {
-          "name": "new_owner",
-          "type": "pubkey"
-        }
-      ]
     }
   ],
   "accounts": [
     {
-      "name": "Config",
+      "name": "ConfigV4",
       "discriminator": [
-        155,
-        12,
-        170,
-        224,
+        9,
+        235,
+        38,
+        85,
         30,
-        250,
-        204,
-        130
+        30,
+        142,
+        95
       ]
     },
     {
@@ -907,16 +875,16 @@
       ]
     },
     {
-      "name": "Router",
+      "name": "Payee",
       "discriminator": [
+        55,
+        185,
+        7,
+        92,
         94,
-        226,
-        217,
-        169,
-        186,
-        4,
-        198,
-        7
+        200,
+        10,
+        246
       ]
     }
   ],
@@ -935,81 +903,42 @@
       ]
     },
     {
-      "name": "Executed",
+      "name": "FeePaid",
       "discriminator": [
-        8,
-        232,
-        139,
-        132,
-        197,
-        45,
-        29,
-        164
-      ]
-    },
-    {
-      "name": "FeeWalletSet",
-      "discriminator": [
-        66,
-        86,
-        57,
-        187,
-        128,
-        107,
-        162,
-        77
-      ]
-    },
-    {
-      "name": "Initialized",
-      "discriminator": [
-        208,
-        213,
-        115,
-        98,
-        115,
-        82,
-        201,
-        209
-      ]
-    },
-    {
-      "name": "MinFeeSet",
-      "discriminator": [
-        60,
-        127,
-        101,
-        230,
-        216,
-        129,
-        188,
-        98
-      ]
-    },
-    {
-      "name": "ProtocolWalletSet",
-      "discriminator": [
-        144,
-        116,
-        23,
-        95,
-        36,
-        208,
         159,
-        149
+        12,
+        52,
+        212,
+        249,
+        36,
+        24,
+        18
       ]
     },
     {
-      "name": "RouterCreated",
+      "name": "PayeeRegistered",
       "discriminator": [
-        242,
-        77,
-        113,
-        111,
-        202,
-        248,
-        118,
-        3
+        120,
+        13,
+        233,
+        106,
+        175,
+        193,
+        229,
+        73
+      ]
+    },
+    {
+      "name": "V4Settings",
+      "discriminator": [
+        192,
+        87,
+        245,
+        138,
+        92,
+        105,
+        166,
+        115
       ]
     }
   ],
@@ -1148,6 +1077,26 @@
       "code": 6026,
       "name": "AccountLamportsTaken",
       "msg": "The swap took lamports from the measured input or output account beyond its token amount"
+    },
+    {
+      "code": 6027,
+      "name": "PayeeMismatch",
+      "msg": "The payee is not registered as that kind, or its stored wallet is not the one the trade expects"
+    },
+    {
+      "code": 6028,
+      "name": "BadRegistration",
+      "msg": "Registration fields are invalid"
+    },
+    {
+      "code": 6029,
+      "name": "BadSignature",
+      "msg": "The registration signature is not the owner's"
+    },
+    {
+      "code": 6030,
+      "name": "AuthorityExposed",
+      "msg": "The swap was handed a writable mint naming the user as an authority, or another account of a mint through which the user can act on accounts it does not own"
     }
   ],
   "types": [
@@ -1168,7 +1117,7 @@
       }
     },
     {
-      "name": "Config",
+      "name": "ConfigV4",
       "type": {
         "kind": "struct",
         "fields": [
@@ -1194,14 +1143,35 @@
           {
             "name": "max_min_fee",
             "docs": [
-              "Cap on the floor, lamports. Set once at initialize; no setter."
+              "Cap on the floor, lamports. Set once at `initialize_v4`; no setter."
             ],
             "type": "u64"
           },
           {
+            "name": "fee_bps",
+            "docs": [
+              "Fee rate, basis points of the SOL side; at most `MAX_FEE_BPS_V4`."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "payee_share_bps",
+            "docs": [
+              "Payee share, basis points of the fee; at most `MAX_PAYEE_SHARE_BPS`."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "community_split_bps",
+            "docs": [
+              "The community's part of the payee share when a trade names both payees, basis points of the share."
+            ],
+            "type": "u16"
+          },
+          {
             "name": "total_credited",
             "docs": [
-              "Sum of all credits; the vault always holds exactly this above its rent reserve."
+              "Sum of all V4 credits (protocol + payees); the V4 vault always holds exactly this above its rent reserve."
             ],
             "type": "u64"
           },
@@ -1240,7 +1210,12 @@
       }
     },
     {
-      "name": "Executed",
+      "name": "FeePaid",
+      "docs": [
+        "One per V4 swap: who traded, which community and referral it named, where their shares were credited, and the",
+        "split. An ID is zero when the trade named none; a wallet is the default key (and its fee 0) when that payee earned",
+        "nothing. fee = protocol_fee + community_fee + referral_fee."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -1249,8 +1224,46 @@
             "type": "pubkey"
           },
           {
-            "name": "router",
+            "name": "community_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "referral_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "community_wallet",
             "type": "pubkey"
+          },
+          {
+            "name": "referral_wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          },
+          {
+            "name": "protocol_fee",
+            "type": "u64"
+          },
+          {
+            "name": "community_fee",
+            "type": "u64"
+          },
+          {
+            "name": "referral_fee",
+            "type": "u64"
           },
           {
             "name": "input_mint",
@@ -1267,30 +1280,26 @@
           {
             "name": "received",
             "type": "u64"
-          },
-          {
-            "name": "fee",
-            "type": "u64"
-          },
-          {
-            "name": "protocol_fee",
-            "type": "u64"
-          },
-          {
-            "name": "trader_fee",
-            "type": "u64"
           }
         ]
       }
     },
     {
-      "name": "FeeWalletSet",
+      "name": "Party",
+      "docs": [
+        "A payee a trade names: its ID and the payout wallet the app expects it to have."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
-            "name": "router",
-            "type": "pubkey"
+            "name": "id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
           },
           {
             "name": "wallet",
@@ -1300,7 +1309,183 @@
       }
     },
     {
-      "name": "Initialized",
+      "name": "Payee",
+      "docs": [
+        "A community (kind 1) or referral (kind 2), at PDA [\"payee\", id], id = the EVM `payeeId`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "kind",
+            "type": "u8"
+          },
+          {
+            "name": "owner",
+            "docs": [
+              "The EVM address that signs its registrations."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                20
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "wallet",
+            "docs": [
+              "Payout wallet on Solana."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "version",
+            "type": "u64"
+          },
+          {
+            "name": "amount",
+            "docs": [
+              "Lamports it can collect."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PayeeRegistered",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "kind",
+            "type": "u8"
+          },
+          {
+            "name": "owner",
+            "type": {
+              "array": [
+                "u8",
+                20
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "version",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Registration",
+      "docs": [
+        "The signed message (same fields and signature as on EVM) plus the signature itself."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "kind",
+            "type": "u8"
+          },
+          {
+            "name": "owner",
+            "type": {
+              "array": [
+                "u8",
+                20
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "evm_wallet",
+            "docs": [
+              "The EVM payout wallet: part of the signed message (unused on Solana)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                20
+              ]
+            }
+          },
+          {
+            "name": "solana_wallet",
+            "docs": [
+              "The Solana payout wallet; must not be empty here."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "version",
+            "type": "u64"
+          },
+          {
+            "name": "signature",
+            "docs": [
+              "r (32) | s (32) | v (1), v = 27 or 28."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                65
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "V4Settings",
+      "docs": [
+        "The V4 settings after any change (and at initialize)."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -1317,105 +1502,16 @@
             "type": "u64"
           },
           {
-            "name": "max_min_fee",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "MinFeeSet",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "lamports",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
-      "name": "ProtocolWalletSet",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "wallet",
-            "type": "pubkey"
-          }
-        ]
-      }
-    },
-    {
-      "name": "Router",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "owner",
-            "type": "pubkey"
-          },
-          {
-            "name": "pending_owner",
-            "type": "pubkey"
-          },
-          {
-            "name": "fee_wallet",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader_fee_bps",
-            "docs": [
-              "Fixed at creation; no setter."
-            ],
+            "name": "fee_bps",
             "type": "u16"
           },
           {
-            "name": "salt",
-            "type": {
-              "array": [
-                "u8",
-                32
-              ]
-            }
-          },
-          {
-            "name": "bump",
-            "type": "u8"
-          }
-        ]
-      }
-    },
-    {
-      "name": "RouterCreated",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "router",
-            "type": "pubkey"
-          },
-          {
-            "name": "owner",
-            "type": "pubkey"
-          },
-          {
-            "name": "fee_wallet",
-            "type": "pubkey"
-          },
-          {
-            "name": "trader_fee_bps",
+            "name": "payee_share_bps",
             "type": "u16"
           },
           {
-            "name": "salt",
-            "type": {
-              "array": [
-                "u8",
-                32
-              ]
-            }
+            "name": "community_split_bps",
+            "type": "u16"
           }
         ]
       }
